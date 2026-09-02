@@ -32,10 +32,17 @@
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
+  "scripts": {
+    "check": "node scripts/validate.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "host.v6.mjs",
     "client.js",
     "cordis.patch.yml",
+    "scripts/validate.mjs",
     "LICENSE",
     "README.md",
     "CHANGELOG.md"
