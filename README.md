@@ -1,5 +1,9 @@
 # dsh-llm-error-retry
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![latest release](https://img.shields.io/github/v/tag/liaoyuqing/dsh-llm-error-retry?label=version)](https://github.com/liaoyuqing/dsh-llm-error-retry/tags)
+[![ci](https://github.com/liaoyuqing/dsh-llm-error-retry/actions/workflows/ci.yml/badge.svg)](https://github.com/liaoyuqing/dsh-llm-error-retry/actions/workflows/ci.yml)
+
 大模型请求错误「休眠后重试」——DSH（DeepSeek Harness）Profile Bundle 插件，带 GUI 配置界面。
 
 模型请求失败（如 `429` 限流）时，按规则命中 → **休眠配置时长** → **自动重新发起请求**；每条规则独立配置休眠时长与最大重试次数，耗尽后错误如实上报。重试过程在**会话框内以原生重试卡片**展示（第 N/M 次 · 休眠 Xs）；规则在 GUI「设置」页实时编辑，保存即生效、跨重启持久。
@@ -83,6 +87,14 @@ web profile 默认 `patchReload: live`，保存即热挂载；刷新 GUI 页面�
 - `webServer` 用 `ctx.inject(['webServer'], …)` 异步等待 + `register` 失败轮询重试：冷启动时 HOME 补丁层先于 webserver 挂载；bundle 层同样存在新旧 fiber 交叠的 duplicate-route 窗口。headless profile 无 webServer → 仅无界面，重试逻辑不受影响。
 - 用户配置绝不能写进包目录（pnpm store 升级即替换）→ 数据目录在 `~/.dsh/llm-error-retry/`。
 - 行为回归用「假 agent + 假 session」探针：`ctx.waterfall('agent/request-error', payload, next)` 触发真实监听链，`session.append` 用收集器承接，零污染真实会话。
+
+## 常见问题
+
+- **怎么确认它在工作？** 触发一次限流错误后：会话框出现「模型重试」卡片（第 N/M 次 · 休眠 Xs）；`~/.dsh/llm-error-retry/status.json` 的 `lastEvents` 会依次记录 `sleeping → retrying`，`waiting` 计数即实时休眠数；宿主日志（`llm-error-retry:` 前缀）同步输出。
+- **会把不该重试的错误重试掉吗？** 只有命中规则的才重试；未命中一律原样放行（内置策略行为不变）。规则命中后预算耗尽即上报，不会无限吞错。
+- **中断会怎样？** 休眠等待可被用户中断/停止即时唤醒，卡片显示为已取消。
+- **升级/卸载后我的规则还在吗？** 规则在 `~/.dsh/llm-error-retry/rules.json`，与包无关；`dsh plugin --profile web remove dsh-llm-error-retry` 后想彻底清除数据再删这个目录即可。
+- **`dsh plugin add` 卡住？** 本包无构建脚本、零依赖，git 安装不需要 `allowBuilds`；若网络到 `github.com:443` 不稳可稍后重试或用 `tarball` 安装提示。
 
 ## 许可
 
