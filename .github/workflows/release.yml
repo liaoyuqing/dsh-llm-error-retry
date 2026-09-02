@@ -1,0 +1,32 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  tarball:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/validate.mjs
+      # Asset name carries NO version, so the awesome-list `tarball:` field may use
+      # latest/download/<fixed name>.tgz without rotting on the next release.
+      - name: Pack
+        run: |
+          npm pack --pack-destination dist
+          mv dist/*.tgz dist/dsh-llm-error-retry.tgz
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "dsh-llm-error-retry ${{ github.ref_name }}" \
+            --generate-notes \
+            --latest \
+            dist/dsh-llm-error-retry.tgz
