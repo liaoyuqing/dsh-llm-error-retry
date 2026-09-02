@@ -1,0 +1,17 @@
+name: Feature request
+description: 新规则形态 / 界面 / 行为提案
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决的问题 / Problem
+      placeholder: 例如：希望按 provider 请求 ID 前缀命中、希望休眠倒计时卡片……
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案 / Proposal
+    validations:
+      required: true

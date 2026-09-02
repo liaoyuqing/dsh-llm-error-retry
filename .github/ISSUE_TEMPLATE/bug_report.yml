@@ -1,0 +1,38 @@
+name: Bug report
+description: 报错行为不符合预期 / something does not behave as documented
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象 / What happened
+      description: 哪个规则没命中 / 没休眠 / 界面异常？贴 status.json 的 lastEvents 片段最好
+      placeholder: |
+        rules: 429 -> 60s x10
+        expected: sleep then retry
+        actual: error propagated immediately
+    validations:
+      required: true
+  - type: textarea
+    id: failure-shape
+    attributes:
+      label: 失败的错误形态 / failure code & message
+      description: 会话里模型错误卡片/turn-error 显示的错误码与消息（截断敏感内容）
+    validations:
+      required: false
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本（status.json 的 version）
+      placeholder: "0.6.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: 安装方式
+      options:
+        - dsh plugin add (profile bundle)
+        - HOME cordis.patch.yml (manual)
+    validations:
+      required: true
