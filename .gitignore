@@ -1,0 +1,4 @@
+# 运行时产物，不入库
+*.status.json
+llm-error-retry.rules.json
+node_modules/
