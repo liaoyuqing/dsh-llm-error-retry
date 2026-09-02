@@ -1,10 +1,10 @@
-// dsh-user-llm-error-retry-ui — 浏览器半（手写 CJS-table bundle，注册协议与打包产物一致）。
+// dsh-llm-error-retry — 浏览器半（手写 CJS-table bundle，注册协议与打包产物一致）。
 // 在 GUI「设置」面板注册一个 "LLM 错误重试" 分区：规则编辑 + 实时状态 + 最近活动。
 // 数据面走同源 fetch 到宿主插件 llm-error-retry 的 /llm-error-retry/api/config 路由。
 // 全文件防御式 try/catch：任何一步失败只损失本卡片，不影响应用启动；
 // 组件内 hooks 恒在前、构造渲染树在 try/catch 内，保证 hooks 顺序稳定。
 window.__ModuleLoader__.load({
-  id: "dsh-user-llm-error-retry-ui",
+  id: "dsh-llm-error-retry",
   factory: function (require) {
     var module = { exports: {} };
     var exports = module.exports;
@@ -198,7 +198,7 @@ window.__ModuleLoader__.load({
 
       exports.apply = apply;
     } catch (error) {
-      console.error("[dsh-user-llm-error-retry-ui] factory failed", error);
+      console.error("[dsh-llm-error-retry] factory failed", error);
     }
     return module.exports;
   },

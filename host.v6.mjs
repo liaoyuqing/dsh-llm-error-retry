@@ -1,29 +1,29 @@
 /**
- * llm-error-retry v5 — 大模型请求错误「休眠后重试」宿主插件。
+ * llm-error-retry v6 — 大模型请求错误「休眠后重试」宿主插件（DSH Profile Bundle 化）。
  *
- * 相比 v4：规则码新增 `字段=值` 形态（如 code=insufficient_quota、
- * type=rate_limit_exceeded），直接匹配 provider 返回 JSON 的字段：
- *   1) failure 对象的同名标量属性；
- *   2) failure.message 内嵌的 {...} JSON 解析后的字段；
- *   3) message 文本的宽松 `"field":"value"` 正则（兜底非规范 JSON）。
- * 规则码三种形态：
- *   - 数字 '429'：匹配 failure.status、failure.code（429/HTTP_429）、
- *     message 中的独立数字（pi-ai 会压平状态码）。
+ * 相比 v5：规则/状态数据文件移出包目录 → 默认 <DSH_HOME|~/.dsh>/llm-error-retry/
+ * {rules.json,status.json}。pnpm 安装进 profile 后包目录位于 store，升级会替换、
+ * 写入也可能被限制，用户配置必须放 HOME 级数据目录才持久。config 仍可覆盖路径。
+ *
+ * 规则码三形态（按顺序取第一条命中）：
+ *   - 数字 '429'：匹配 failure.status、failure.code（'429'/'HTTP_429'）、
+ *     message 中的独立数字（pi-ai 类适配器会把 HTTP 状态压平进 message）。
  *   - 机器码 'RATE_LIMIT'/'QUOTA'…：匹配 failure.code（忽略大小写）。
- *   - '字段=值'：匹配 provider 响应字段（上述三层）。
+ *   - '字段=值'（如 code=insufficient_quota）：匹配 provider 返回 JSON 字段：
+ *     ① failure.<字段> 标量属性；② message 内嵌 {...} JSON 解析；③ 宽松文本 "字段":"值"。
  *
- * 其余不变：命中 → 休眠该码的 delayMs → {kind:'retry'} 重新请求；每码独立
- * maxRetries，耗尽即上报；prepend 优先于内置 llm-retry；按
- * provider/turn/step 计数重置；Retry-After 取更长；休眠/重试过程通过
- * 'llm/retry' + 'llm/retry-started' 会话事件对显示为聊天区 model-retry 卡片。
+ * 命中 → 休眠 delayMs → {kind:'retry'} 重新请求；每规则独立 maxRetries，
+ * 耗尽即上报；prepend 优先于内置 llm-retry；按 provider/turn/step 计数重置；
+ * Retry-After 更长时按提示（封顶 1h）；休眠/重试经 'llm/retry' +
+ * 'llm/retry-started' 会话事件对显示为聊天区重试卡片。
  *
- * 配置来源（高→低）：界面保存的 <本目录>/llm-error-retry.rules.json → 补丁行 config.rules。
+ * 配置来源（高→低）：<数据目录>/rules.json（界面保存）→ 补丁行 config.rules → 默认 429×60s×10。
  * 界面：GUI「设置」→「LLM 错误重试」；备用页 http://127.0.0.1:3080/llm-error-retry
  */
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
 export const name = 'llm-error-retry'
 export const inject = ['timer']
@@ -195,7 +195,7 @@ function renderPage() {
     <button id="revert">放弃本地修改</button>
   </div>
   <div id="notice" class="notice"></div>
-  <div class="hint">规则码三种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 与 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）。多条规则按顺序取第一条命中。delayMs 100~3600000；次数 0~100（0=命中即上报）。Retry-After 更长时按提示。休眠/重试显示在会话框重试卡片中。保存写 llm-error-retry.rules.json 并即时生效；删该文件回落 cordis.patch.yml 默认。</div>
+  <div class="hint">规则码三种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~100（0 = 命中即上报）。服务端 Retry-After 更长时按提示。休眠/重试过程显示在会话框重试卡片中。保存写入 ~/.dsh/llm-error-retry/rules.json 并立即生效；删除该文件回落到 cordis.patch.yml 默认规则。</div>
   <div class="sub" style="margin-top:18px"><b>最近活动</b></div>
   <ul id="events"><li>加载中…</li></ul>
 <script>
@@ -291,13 +291,16 @@ function renderPage() {
 }
 
 export function apply(ctx, config = {}) {
-  const baseDir = dirname(fileURLToPath(import.meta.url))
+  const dataDir = typeof config.dataDir === 'string' && config.dataDir.trim()
+    ? config.dataDir
+    : join(process.env['DSH_HOME'] || join(homedir(), '.dsh'), 'llm-error-retry')
+  try { mkdirSync(dataDir, { recursive: true }) } catch {}
   const statusFile = typeof config.statusFile === 'string' && config.statusFile.trim()
     ? config.statusFile
-    : join(baseDir, 'llm-error-retry.status.json')
+    : join(dataDir, 'status.json')
   const rulesFile = typeof config.rulesFile === 'string' && config.rulesFile.trim()
     ? config.rulesFile
-    : join(baseDir, 'llm-error-retry.rules.json')
+    : join(dataDir, 'rules.json')
   const yamlRules = validateRules(config.rules === undefined ? DEFAULT_RULES : config.rules)
 
   let rules = yamlRules
@@ -335,6 +338,7 @@ export function apply(ctx, config = {}) {
         status: 'mounted',
         mountedAt: new Date().toISOString(),
         pid: process.pid,
+        version: '0.6.0',
         rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
         rulesSource,
         ui: UI_PATH,

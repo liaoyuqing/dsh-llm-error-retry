@@ -1,0 +1,51 @@
+{
+  "name": "dsh-llm-error-retry",
+  "version": "0.6.0",
+  "description": "DSH (DeepSeek Harness) 插件：大模型请求报错时按规则休眠后自动重试。支持 HTTP 状态码 / 机器码 / provider 返回字段=值 三种命中形态，每条规则独立配置休眠时长与最大重试次数；会话框内显示重试卡片，GUI 设置页实时编辑规则。",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liaoyuqing/dsh-llm-error-retry.git"
+  },
+  "bugs": {
+    "url": "https://github.com/liaoyuqing/dsh-llm-error-retry/issues"
+  },
+  "homepage": "https://github.com/liaoyuqing/dsh-llm-error-retry#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "llm",
+    "retry",
+    "429",
+    "rate-limit",
+    "backoff"
+  ],
+  "author": "liaoyuqing",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./host.v6.mjs",
+  "exports": {
+    ".": "./host.v6.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.v6.mjs",
+    "client.js",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

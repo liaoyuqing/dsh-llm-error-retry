@@ -1,4 +1,7 @@
-# 运行时产物，不入库
+# 运行时产物 / 包管理残留，不入库
+node_modules/
+rules.json
+status.json
 *.status.json
 llm-error-retry.rules.json
-node_modules/
+pnpm-lock.yaml

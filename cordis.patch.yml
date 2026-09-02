@@ -1,0 +1,17 @@
+# dsh-llm-error-retry — Profile Bundle 自带补丁：把宿主半插进 host 组合。
+# 浏览器半（设置页分区）由 client-modules 扫描本包 package.json 的 dsh.client 声明自动并入 GUI 启动图。
+# 默认规则在这里定义；日常改规则请直接用 GUI（设置 → LLM 错误重试），
+# 它会写入 ~/.dsh/llm-error-retry/rules.json 并优先于本文件。
+# 想固定改 YAML：在 ~/.dsh/cordis.patch.yml 加同 id 行整体覆盖 config（HOME 层优先于 bundle 层）。
+- insert:
+    - id: llm-error-retry
+      name: ./host.v6.mjs
+      config:
+        rules:
+          - code: '429'        # HTTP 状态码（status / code / message 独立数字 三通道匹配）
+            delayMs: 60000     # 命中后休眠 60 秒再重新请求
+            maxRetries: 10     # 最多重试 10 次，耗尽后错误上报
+          # 更多规则按同样格式追加（按顺序取第一条命中），例如按 provider 响应字段命中：
+          # - code: type=insufficient_quota
+          #   delayMs: 60000
+          #   maxRetries: 10
