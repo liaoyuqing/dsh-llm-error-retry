@@ -19,6 +19,7 @@ jobs:
       # latest/download/<fixed name>.tgz without rotting on the next release.
       - name: Pack
         run: |
+          mkdir -p dist
           npm pack --pack-destination dist
           mv dist/*.tgz dist/dsh-llm-error-retry.tgz
       - name: Release
