@@ -5,7 +5,7 @@
 # 想固定改 YAML：在 ~/.dsh/cordis.patch.yml 加同 id 行整体覆盖 config（HOME 层优先于 bundle 层）。
 - insert:
     - id: llm-error-retry
-      name: ./host.v6.mjs
+      name: ./host.v7.mjs
       config:
         rules:
           - code: '429'        # HTTP 状态码（status / code / message 独立数字 三通道匹配）

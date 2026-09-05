@@ -1,9 +1,8 @@
 /**
- * llm-error-retry v6 — 大模型请求错误「休眠后重试」宿主插件（DSH Profile Bundle 化）。
+ * llm-error-retry v7 — 大模型请求错误「休眠后重试」宿主插件（DSH Profile Bundle 化）。
  *
- * 相比 v5：规则/状态数据文件移出包目录 → 默认 <DSH_HOME|~/.dsh>/llm-error-retry/
- * {rules.json,status.json}。pnpm 安装进 profile 后包目录位于 store，升级会替换、
- * 写入也可能被限制，用户配置必须放 HOME 级数据目录才持久。config 仍可覆盖路径。
+ * 相比 v6：单条规则的最大重试次数上限放宽到 1000（MAX_RETRIES_LIMIT），
+ * 其余不变。数据文件默认在 <DSH_HOME|~/.dsh>/llm-error-retry/{rules.json,status.json}。
  *
  * 规则码三形态（按顺序取第一条命中）：
  *   - 数字 '429'：匹配 failure.status、failure.code（'429'/'HTTP_429'）、
@@ -31,7 +30,7 @@ export const inject = ['timer']
 const DEFAULT_RULES = [{ code: '429', delayMs: 60_000, maxRetries: 10 }]
 const MIN_DELAY_MS = 100
 const MAX_DELAY_MS = 3_600_000
-const MAX_RETRIES_LIMIT = 100
+const MAX_RETRIES_LIMIT = 1000
 const EVENT_LOG_LIMIT = 20
 const UI_PATH = '/llm-error-retry'
 
@@ -195,7 +194,7 @@ function renderPage() {
     <button id="revert">放弃本地修改</button>
   </div>
   <div id="notice" class="notice"></div>
-  <div class="hint">规则码三种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~100（0 = 命中即上报）。服务端 Retry-After 更长时按提示。休眠/重试过程显示在会话框重试卡片中。保存写入 ~/.dsh/llm-error-retry/rules.json 并立即生效；删除该文件回落到 cordis.patch.yml 默认规则。</div>
+  <div class="hint">规则码三种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~1000（0 = 命中即上报）。服务端 Retry-After 更长时按提示。休眠/重试过程显示在会话框重试卡片中。保存写入 ~/.dsh/llm-error-retry/rules.json 并立即生效；删除该文件回落到 cordis.patch.yml 默认规则。</div>
   <div class="sub" style="margin-top:18px"><b>最近活动</b></div>
   <ul id="events"><li>加载中…</li></ul>
 <script>
@@ -222,7 +221,7 @@ function renderPage() {
       var delay = document.createElement('input'); delay.type = 'number'; delay.min = '0.1'; delay.step = '1'; delay.value = r.delayMs / 1000;
       delay.oninput = function () { rows[i].delayMs = Math.max(0, Math.round((parseFloat(delay.value) || 0) * 1000)); markDirty(); };
       cell(delay);
-      var max = document.createElement('input'); max.type = 'number'; max.min = '0'; max.max = '100'; max.step = '1'; max.value = r.maxRetries;
+      var max = document.createElement('input'); max.type = 'number'; max.min = '0'; max.max = '1000'; max.step = '1'; max.value = r.maxRetries;
       max.oninput = function () { rows[i].maxRetries = Math.max(0, Math.round(Number(max.value) || 0)); markDirty(); };
       cell(max);
       var del = document.createElement('button'); del.className = 'link'; del.textContent = '×'; del.title = '删除该规则';
@@ -338,7 +337,7 @@ export function apply(ctx, config = {}) {
         status: 'mounted',
         mountedAt: new Date().toISOString(),
         pid: process.pid,
-        version: '0.6.0',
+        version: '0.7.0',
         rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
         rulesSource,
         ui: UI_PATH,

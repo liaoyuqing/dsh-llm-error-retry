@@ -165,7 +165,7 @@ window.__ModuleLoader__.load({
             bodyRows.push(e("tr", { key: i },
               e("td", { style: S.td }, e("input", { style: Object.assign({}, S.input, { width: "200px" }), value: row.code, placeholder: "429 / RATE_LIMIT / code=xxx", onChange: function (ev) { updateRow(i, "code", ev.target.value); } })),
               e("td", { style: S.td }, e("input", { type: "number", min: "0.1", step: "1", style: Object.assign({}, S.input, { width: "90px" }), value: row.delayMs / 1000, onChange: function (ev) { updateRow(i, "delay", ev.target.value); } })),
-              e("td", { style: S.td }, e("input", { type: "number", min: "0", max: "100", step: "1", style: Object.assign({}, S.input, { width: "80px" }), value: row.maxRetries, onChange: function (ev) { updateRow(i, "max", ev.target.value); } })),
+              e("td", { style: S.td }, e("input", { type: "number", min: "0", max: "1000", step: "1", style: Object.assign({}, S.input, { width: "80px" }), value: row.maxRetries, onChange: function (ev) { updateRow(i, "max", ev.target.value); } })),
               e("td", { style: S.td }, e("button", { style: S.del, title: "删除该规则", onClick: function () { removeRow(i); } }, "×"))));
           });
           children.push(e("table", { style: S.table, key: "tbl" }, head, e("tbody", null, bodyRows)));
@@ -175,7 +175,7 @@ window.__ModuleLoader__.load({
             dirty ? e("button", { style: S.btn, key: "discard", onClick: discard }, "放弃修改") : null));
           if (snap.notice !== "") children.push(e("div", { style: snap.notice.indexOf("失败") >= 0 ? S.err : S.ok, key: "n" }, snap.notice));
           if (snap.error !== "") children.push(e("div", { style: S.err, key: "e" }, "宿主接口异常：" + snap.error + "（若插件刚重启稍候自动恢复）"));
-          children.push(e("div", { style: S.hint, key: "h" }, "规则码三种形态：① HTTP 状态码（429、500…：匹配 status、code 与 message 中独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER…）；③ 字段=值（如 code=insufficient_quota、type=rate_limit_exceeded：匹配 provider 返回 JSON 字段，含被压平进 message 的响应体）。多条规则按顺序取第一条命中。保存持久化到 llm-error-retry.rules.json；删除该文件回落到 cordis.patch.yml 默认规则。"));
+          children.push(e("div", { style: S.hint, key: "h" }, "规则码三种形态：① HTTP 状态码（429、500…：匹配 status、code 与 message 中独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER…）；③ 字段=值（如 code=insufficient_quota、type=rate_limit_exceeded：匹配 provider 返回 JSON 字段，含被压平进 message 的响应体）。多条规则按顺序取第一条命中。次数上限 0~1000。保存持久化到 llm-error-retry.rules.json；删除该文件回落到 cordis.patch.yml 默认规则。"));
           children.push(e("div", { style: Object.assign({}, S.title, { marginTop: "14px", fontSize: "13px" }), key: "eh" }, "最近活动"));
           if ((snap.activity || []).length === 0) {
             children.push(e("div", { style: { opacity: 0.6, fontSize: "12px" }, key: "ae" }, "暂无记录"));

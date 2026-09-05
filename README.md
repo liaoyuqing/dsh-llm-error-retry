@@ -33,12 +33,12 @@ dsh plugin --profile web remove dsh-llm-error-retry # 卸载
 
 ### 手动安装（不经过 pnpm 的兜底方式）
 
-把仓库文件（`host.v6.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
+把仓库文件（`host.v7.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
 
 ```yaml
 - insert:
     - id: llm-error-retry
-      name: ./plugins/llm-error-retry-ui/host.v6.mjs
+      name: ./plugins/llm-error-retry-ui/host.v7.mjs
       config:
         rules:
           - code: '429'
@@ -58,7 +58,7 @@ web profile 默认 `patchReload: live`，保存即热挂载；刷新 GUI 页面�
 | 机器码 | `RATE_LIMIT`、`QUOTA`、`SERVER`、`TRANSPORT`、`TIMEOUT`、`EMPTY_RESPONSE` | `failure.code`（忽略大小写，DSH 适配器的 provider 无关分类码） |
 | 字段=值 | `code=insufficient_quota`、`type=rate_limit_exceeded` | **provider 返回 JSON 的字段名与值**，三层兜底：① `failure.<字段>` 标量属性 → ② `failure.message` 内嵌 `{...}` JSON 解析 → ③ message 宽松文本 `"字段":"值"` |
 
-约束：`delayMs` ∈ 100~3600000；`maxRetries` ∈ 0~100（`0` = 命中即上报）。
+约束：`delayMs` ∈ 100~3600000；`maxRetries` ∈ 0~1000（`0` = 命中即上报）。
 
 行为细节：
 
@@ -77,7 +77,7 @@ web profile 默认 `patchReload: live`，保存即热挂载；刷新 GUI 页面�
 
 ## 工作原理
 
-- **宿主半**（`host.v6.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链），聊天区原生卡片即时渲染。
+- **宿主半**（`host.v7.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链），聊天区原生卡片即时渲染。
 - **浏览器半**（`client.js`）：DSH 的双拼包机制——`package.json` 声明 `dsh.client.platform=web` + `exports["./client"]`，宿主 client-modules 扫描到后把 bundle 并入 GUI 启动图（`window.__ModuleLoader__.load` 注册协议，与官方打包产物一致），在浏览器端注册 `settings.section` 设置分区。数据面走宿主 `webServer` 路由 `/llm-error-retry/api/config`（同源 fetch）。
 
 ## 二次开发注意（DSH 平台怪癖清单）

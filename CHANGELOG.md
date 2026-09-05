@@ -2,6 +2,11 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半模块文件名带 `vN` 是 DSH config-only HMR 的缓存失效手段（同路径模块不会被重新 import），与产品版本号的对应关系见下。
 
+## 0.7.0 — 2026-09-02
+
+- 单条规则的最大重试次数上限放宽：`MAX_RETRIES_LIMIT` 100 → **1000**（校验、备用页输入框、设置分区输入框、文档同步到 `maxRetries ∈ 0~1000`）。
+- 宿主半：`host.v7.mjs`（重命名仅为绕过 DSH config-only HMR 不重载同路径模块的限制）。
+
 ## 0.6.0 — 2026-09-02
 
 - **仓库重构为 DSH Profile Bundle 包**：`dsh plugin --profile web add github:liaoyuqing/dsh-llm-error-retry` 一条命令安装（与 dshmarket / dsh-cost-meter 等社区插件一致），不再需要手工编辑 `~/.dsh/cordis.patch.yml`。
