@@ -2,6 +2,37 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半模块文件名带 `vN` 是 DSH config-only HMR 的缓存失效手段（同路径模块不会被重新 import），与产品版本号的对应关系见下。
 
+## 0.14.0 — 2026-10-20
+
+- **服务端 Retry-After 改为有上限地采信**（`honorRetryAfterMaxMs`，默认 60s）。此前把提示封顶在 1 小时并**直接覆盖**规则里自己写的休眠时长：上游对 429 常回 `Retry-After: 3600`（“Rate limit exceeded. Please try again later.”），于是规则里的 10s 被悄悄抬成整小时，会话一小时不动且界面看不出是谁改的。现在提示**只能把等待调大**、且不超过该上限；超出时按规则自己的 `delayMs` 重试，并在事件里记录原始要求与截断原因。上限 0 = 完全忽略提示。
+- **该上限挪进设置界面**：GUI「设置 → LLM 错误重试」新增独立输入框（秒，0–3600，0 = 忽略服务端提示），保存写入 `rules.json` 的 `honorRetryAfterMaxMs`，与规则一起立即生效；文件值优先于补丁行，坏值只忽略该字段、不连累规则整体回落。
+- **设置分区按钮可读性修复**：主按钮改用 `--dsw-alias-button-primary-fill` + `--dsw-alias-label-primary-foreground`。此前用 `--dsw-alias-brand-primary` 配 `#fff`，在深色主题下底色是近白（neutral-bluish-50）而文字写死白色 → 白底白字，按钮等于隐形。
+- 宿主半：`host.v14.mjs`。
+
+## 0.13.0 — 2026-10-20
+
+- **输出截断自动续写**（`config.maxTokens`）：模型输出达到 token 上限被截断时自动注入一条「继续」，无需人工发消息。
+  - max-tokens 不是失败：pi-ai 映射成 `{ kind: 'max-tokens' }`，agent-loop 结算为步骤结束原因，而 `agent/request-error` 瀑布只在 error/aborted 时触发——所以它进不了规则通道，必须另走钩子。
+  - 接力点选在 `agent/turn-stopping`：宿主把 max-tokens 记在**轮次**上且是粘性的（后续步骤正常完成也不能降级），一旦粘住，普通「工具调用后自动继续」就失效了。
+  - 两类接力分开计数：「截断→续写→又截断」受 `maxContinues` 封顶、续写前休眠 `delayMs`；「工具结果待回喂」是宿主本来就会做的那一步，不计入 `maxContinues`、不休眠、无上限（共用预算会让长工具轮在第 5 步后把工具结果卡在对话外面）。
+  - 跨轮自动重启：轮次仍以粘性 max-tokens 收尾时（goal 驱动见该 reason 即 disarm，没人开新轮），只要本轮有实质推进就等旧 driver 收敛后自动 `followup` 一条「继续」开新轮；连续上限 `restartTurns`，正常收尾清零，无推进则停。
+- 宿主半：`host.v13.mjs`。
+
+## 0.12.0 — 2026-10-14
+
+- 跨轮自动重启落地（详见 0.13.0 的续写说明）：`restartTurns` / `restartDelayMs` 可配，轮次以粘性 max-tokens 收尾且本轮有推进时自动开新轮。
+- 宿主半：`host.v12.mjs`。
+
+## 0.11.0 — 2026-10-10
+
+- 截断续写与工具步接力**分开计数**：`maxContinues` 只约束「截断→续写→又截断」，工具步接力无上限、零休眠。
+- 宿主半：`host.v11.mjs`。
+
+## 0.8.0 – 0.10.0 — 2026-10-08 ~ 2026-10-10
+
+- 新增「输出截断自动继续」与 `msg~子串` 规则码形态；修正「只接力一步就停」（截断后模型通常还会正常跑一步工具调用，读「最后一步的 finish」会让条件永不满足），改为按「本轮是否曾截断」判断，并在模型欠回答的工具步后同样接力。续写预算按轮累计、不随步重置。
+- 宿主半：`host.v8.mjs` → `host.v10.mjs`。
+
 ## 0.7.0 — 2026-09-02
 
 - 单条规则的最大重试次数上限放宽：`MAX_RETRIES_LIMIT` 100 → **1000**（校验、备用页输入框、设置分区输入框、文档同步到 `maxRetries ∈ 0~1000`）。

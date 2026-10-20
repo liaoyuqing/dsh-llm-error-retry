@@ -5,12 +5,26 @@
 # 想固定改 YAML：在 ~/.dsh/cordis.patch.yml 加同 id 行整体覆盖 config（HOME 层优先于 bundle 层）。
 - insert:
     - id: llm-error-retry
-      name: ./host.v7.mjs
+      name: ./host.v14.mjs
       config:
+        # 服务端 Retry-After 提示最多被采信多久（毫秒）。0 = 完全忽略提示、只按规则节奏。
+        honorRetryAfterMaxMs: 60000
+        # 模型输出达到 token 上限被截断时，自动注入一条消息让它接着输出（免人工打「继续」）
+        maxTokens:
+          enabled: true      # 关掉则恢复原样：截断后等你手动继续
+          text: '继续'        # 注入内容
+          maxContinues: 5    # 每轮最多自动续写 5 次（只约束截断续写，防死循环；
+                             # 工具步接力不计此限）
+          delayMs: 3000      # 截断续写前休眠 3 秒，别打爆 provider（工具步接力不休眠）
+          restartTurns: 10   # 轮次以粘性 max-tokens 收尾时，最多连开 10 个新轮
+          restartDelayMs: 1200  # 重开前等旧 driver 收敛的时间（不能省：running 阶段
+                             # 投递的唤醒会被 agent-loop 丢弃）
         rules:
-          - code: '429'        # HTTP 状态码（status / code / message 独立数字 三通道匹配）
+          - code: '429'        # HTTP 状态码 429（限流）；也可写机器码 RATE_LIMIT
             delayMs: 60000     # 命中后休眠 60 秒再重新请求
-            maxRetries: 10     # 最多重试 10 次，耗尽后错误上报
+            maxRetries: 10     # 该错误码最多重试 10 次，耗尽后错误上报
+          - code: 'msg~finish_reason: error'
+            delayMs: 10000     # provider 以 finish_reason 终止请求：休眠 10 秒重试
           # 更多规则按同样格式追加（按顺序取第一条命中），例如按 provider 响应字段命中：
           # - code: type=insufficient_quota
           #   delayMs: 60000

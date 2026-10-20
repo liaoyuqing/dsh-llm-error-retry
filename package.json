@@ -1,7 +1,7 @@
 {
   "name": "dsh-llm-error-retry",
-  "version": "0.7.0",
-  "description": "DSH (DeepSeek Harness) 插件：大模型请求报错时按规则休眠后自动重试。支持 HTTP 状态码 / 机器码 / provider 返回字段=值 三种命中形态，每条规则独立配置休眠时长与最大重试次数；会话框内显示重试卡片，GUI 设置页实时编辑规则。",
+  "version": "0.14.0",
+  "description": "DSH (DeepSeek Harness) 插件：大模型请求报错时按规则休眠后自动重试。支持 HTTP 状态码 / 机器码 / provider 返回字段=值 / msg~子串 四种命中形态，每条规则独立配置休眠时长与最大重试次数；输出达到 token 上限被截断时自动注入「继续」接力，会话框内显示重试卡片，GUI 设置页实时编辑规则。",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -20,15 +20,17 @@
     "retry",
     "429",
     "rate-limit",
-    "backoff"
+    "backoff",
+    "max-tokens",
+    "continuation"
   ],
   "author": "liaoyuqing",
   "engines": {
     "node": ">=20"
   },
-  "main": "./host.v7.mjs",
+  "main": "./host.v14.mjs",
   "exports": {
-    ".": "./host.v7.mjs",
+    ".": "./host.v14.mjs",
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
@@ -39,7 +41,7 @@
     "access": "public"
   },
   "files": [
-    "host.v7.mjs",
+    "host.v14.mjs",
     "client.js",
     "cordis.patch.yml",
     "scripts/validate.mjs",
