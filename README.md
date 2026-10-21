@@ -36,12 +36,12 @@ dsh plugin --profile web remove dsh-llm-error-retry # 卸载
 
 ### 手动安装（不经过 pnpm 的兜底方式）
 
-把仓库文件（`host.v14.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
+把仓库文件（`host.v15.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
 
 ```yaml
 - insert:
     - id: llm-error-retry
-      name: ./plugins/llm-error-retry-ui/host.v14.mjs
+      name: ./plugins/llm-error-retry-ui/host.v15.mjs
       config:
         rules:
           - code: '429'
@@ -92,17 +92,34 @@ maxTokens:
   restartDelayMs: 1200  # 重开前等旧 driver 收敛的时间（不能省：running 阶段投递的唤醒会被丢弃）
 ```
 
+## 首字超时
+
+「输出截断自动续写」管的是「说到一半被截断」，首字超时管的是「一个字都不说」：请求发出后超过 `firstTokenTimeout.timeoutMs` 仍没有任何内容增量，就中断这次请求并报超时。
+
+- **什么叫「第一个字」**：`text-delta`（正文）、`reasoning-delta`（**思考**）、`tool-call-delta`（工具调用）任一到达即撤销计时。只收到 `block-start`/`usage` 这类不含内容的结构帧不算——所以在计时窗口内一直有思考流出的推理模型不会误伤。
+- **接缝是 `llm/stream` 中间件**（waterfall，`global: true`）：包住下游流，在第一次拉取处起表。超时后停止拉取，并**产出一个合成的终止 chunk** `{ type: 'finish', reason: { kind: 'error', failure: { code: 'TIMEOUT', message: '首字超时：…' } } }`。之所以不抛异常：中间的 waterfall 抛错会直接穿出 agent-loop（`llm/src/index.ts` 明确「middleware 失败仍抛出」），不经过 `agent/request-error` 瀑布，本插件的规则引擎就没机会重试；合成 finish 则走宿主正常失败路径——因此**再配一条规则码 `TIMEOUT` 就能自动重试**，否则它作为本轮错误上报，聊天区显示超时原因。
+- **只约束 agent 主请求**：`compaction` / `session-title` 这类带 `purpose` 的调用不设限（压缩中途被打断会伤上下文），没有 `sessionId` 的零散调用也无从归属。
+- **已知限制**：放弃消费不等于立刻断开连接。异步生成器停在 `await` 时 `return()` 是排队的，上游 HTTP 请求可能在 provider 自己响应或 pi-ai 的流空闲 watchdog（`profile.streamIdleTimeoutMs`）触发前继续挂着；本接缝拿不到也不该改宿主的请求对象（它被 `Object.freeze` 且带 agent-loop 的对象身份标记），无法注入自己的 AbortSignal。
+
+对应配置（补丁行 `config.firstTokenTimeout`，或设置分区里的「首字超时」开关 + 秒数）：
+
+```yaml
+firstTokenTimeout:
+  enabled: true
+  timeoutMs: 180000   # 1000–3600000；长思考模型别设太小，否则正常请求也会被判超时
+```
+
 ## 配置来源（优先级从高到低）
 
-1. **GUI 界面保存**：`~/.dsh/llm-error-retry/rules.json`（含设置分区与备用页，两处等价；跨重启持久，`npm` 升级不影响）。文件里除 `rules` 外还存 `honorRetryAfterMaxMs`（Retry-After 采信上限，毫秒）。
-2. `~/.dsh/cordis.patch.yml` 中同 id（`llm-error-retry`）覆盖行的 `config.rules` 与 `config.honorRetryAfterMaxMs`。
+1. **GUI 界面保存**：`~/.dsh/llm-error-retry/rules.json`（含设置分区与备用页，两处等价；跨重启持久，`npm` 升级不影响）。文件里除 `rules` 外还存 `honorRetryAfterMaxMs`（Retry-After 采信上限）与 `firstTokenTimeout`（首字超时）。
+2. `~/.dsh/cordis.patch.yml` 中同 id（`llm-error-retry`）覆盖行的 `config.rules`、`config.honorRetryAfterMaxMs` 与 `config.firstTokenTimeout`。
 3. 本包内置默认（`cordis.patch.yml`）：`429 → 60s × 10`。
 
 运行快照与事件流水：`~/.dsh/llm-error-retry/status.json`（`config.dataDir` 可改数据目录）。
 
 ## 工作原理
 
-- **宿主半**（`host.v14.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子。
+- **宿主半**（`host.v15.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子；首字超时走 `llm/stream` waterfall（包一层异步生成器，到点产出合成的 TIMEOUT finish chunk）。
 - **浏览器半**（`client.js`）：DSH 的双拼包机制——`package.json` 声明 `dsh.client.platform=web` + `exports["./client"]`，宿主 client-modules 扫描到后把 bundle 并入 GUI 启动图（`window.__ModuleLoader__.load` 注册协议，与官方打包产物一致），在浏览器端注册 `settings.section` 设置分区。数据面走宿主 `webServer` 路由 `/llm-error-retry/api/config`（同源 fetch）。
 
 ## 二次开发注意（DSH 平台怪癖清单）

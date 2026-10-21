@@ -5,10 +5,15 @@
 # 想固定改 YAML：在 ~/.dsh/cordis.patch.yml 加同 id 行整体覆盖 config（HOME 层优先于 bundle 层）。
 - insert:
     - id: llm-error-retry
-      name: ./host.v14.mjs
+      name: ./host.v15.mjs
       config:
         # 服务端 Retry-After 提示最多被采信多久（毫秒）。0 = 完全忽略提示、只按规则节奏。
         honorRetryAfterMaxMs: 60000
+        # 首字超时：请求发出后多久还没有第一个字（正文/思考/工具调用任一）就中断本次请求
+        # 并按 TIMEOUT 失败上报。可再配一条规则码 TIMEOUT 让它自动重试。范围 1000–3600000 毫秒。
+        firstTokenTimeout:
+          enabled: true
+          timeoutMs: 180000
         # 模型输出达到 token 上限被截断时，自动注入一条消息让它接着输出（免人工打「继续」）
         maxTokens:
           enabled: true      # 关掉则恢复原样：截断后等你手动继续

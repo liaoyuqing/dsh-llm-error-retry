@@ -2,6 +2,15 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半模块文件名带 `vN` 是 DSH config-only HMR 的缓存失效手段（同路径模块不会被重新 import），与产品版本号的对应关系见下。
 
+## 0.15.0 — 2026-10-21
+
+- **新增首字超时**（`firstTokenTimeout`，默认 180s，设置分区可改）。请求发出后超过设定时间仍没有任何内容增量（正文 / **思考** / 工具调用任一都算），就中断这次请求并报超时。
+  - **为什么不是一个规则码**：没出字时根本没有失败事件——`agent/request-error` 不会触发，规则引擎没有入口；只能在上游接一层。
+  - **接缝是 `llm/stream` waterfall**：包住下游异步迭代器，在第一次拉取处起表，超时后停止拉取并产出**合成的终止 chunk** `{ type: 'finish', reason: { kind: 'error', failure: { code: 'TIMEOUT' } } }`。不抛异常是因为中间件抛错会直接穿出 agent-loop（不经过 `agent/request-error` 瀑布），规则引擎同样没机会重试；合成 finish 走宿主正常失败路径，**再配一条 `TIMEOUT` 规则即可自动重试**。
+  - **只约束 agent 主请求**：带 `purpose` 的会话标题 / 上下文压缩不设限（压缩被打断会伤上下文），无 `sessionId` 的零散调用也不管。
+  - **已知限制**：放弃消费 ≠ 立刻断开连接。生成器停在 `await` 时 `return()` 是排队的，上游请求要到 provider 自己响应或 pi-ai 的流空闲 watchdog 才收尾；宿主的请求对象被 freeze 且带 agent-loop 对象身份标记，插件既拿不到也不该替换它的 AbortSignal。
+- 宿主半：`host.v15.mjs`。
+
 ## 0.14.0 — 2026-10-20
 
 - **服务端 Retry-After 改为有上限地采信**（`honorRetryAfterMaxMs`，默认 60s）。此前把提示封顶在 1 小时并**直接覆盖**规则里自己写的休眠时长：上游对 429 常回 `Retry-After: 3600`（“Rate limit exceeded. Please try again later.”），于是规则里的 10s 被悄悄抬成整小时，会话一小时不动且界面看不出是谁改的。现在提示**只能把等待调大**、且不超过该上限；超出时按规则自己的 `delayMs` 重试，并在事件里记录原始要求与截断原因。上限 0 = 完全忽略提示。

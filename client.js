@@ -22,6 +22,7 @@ window.__ModuleLoader__.load({
         restart: "已自动重开新轮",
         "restart-exhausted": "重开新轮次数用尽，等人工",
         "restart-stalled": "本轮无实质推进，未重开新轮",
+        "first-token-timeout": "首字超时，已中断",
       };
       var S = {
         root: { fontSize: "13px", lineHeight: 1.6, padding: "16px 20px 24px", maxWidth: "760px", color: "var(--dsw-alias-label-primary, inherit)" },
@@ -66,9 +67,10 @@ window.__ModuleLoader__.load({
       function getJson() {
         return fetch(API, { credentials: "same-origin", cache: "no-store" }).then(readConfigResponse);
       }
-      function postRules(rules, honorRetryAfterMaxMs) {
+      function postRules(rules, honorRetryAfterMaxMs, firstTokenTimeout) {
         var payload = { rules: rules };
         if (honorRetryAfterMaxMs !== undefined) payload.honorRetryAfterMaxMs = honorRetryAfterMaxMs;
+        if (firstTokenTimeout !== undefined) payload.firstTokenTimeout = firstTokenTimeout;
         return fetch(API, {
           method: "POST", credentials: "same-origin", cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -92,6 +94,14 @@ window.__ModuleLoader__.load({
         if (ms <= 120000) return "适度的服务端礼貌等待";
         return "较顺从服务端（最长要等 " + Math.round(ms / 1000) + "s）";
       }
+      /** 首字超时的即时说明。 */
+      function firstNote(cfg) {
+        if (!cfg || cfg.enabled !== true) return "已关闭：模型多久不出字都一直等";
+        var s = Math.round((Number(cfg.timeoutMs) || 0) / 1000);
+        if (s <= 60) return "很激进：一分钟没出字就中断";
+        if (s <= 300) return "偏严格：多数请求能过，思考很长的会超时";
+        return "宽松：给长思考留足时间";
+      }
 
       function apply(ctx) {
         try {
@@ -107,7 +117,7 @@ window.__ModuleLoader__.load({
       }
 
       function Section() {
-        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0 });
+        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 180000 } });
         var snap = snapPair[0]; var setSnap = snapPair[1];
         var draftPair = React.useState(null);
         var draft = draftPair[0]; var setDraft = draftPair[1];
@@ -115,6 +125,8 @@ window.__ModuleLoader__.load({
         // 否则「保存」按钮会为一个纯设置改动而多出一行规则重写。
         var honorPair = React.useState(null);
         var honorDraft = honorPair[0]; var setHonorDraft = honorPair[1];
+        var firstPair = React.useState(null);
+        var firstDraft = firstPair[0]; var setFirstDraft = firstPair[1];
 
         function pull(keepNotice) {
           getJson().then(function (cfg) {
@@ -124,11 +136,12 @@ window.__ModuleLoader__.load({
                 waiting: cfg.waiting || 0, source: cfg.source || "", error: "",
                 notice: keepNotice ? prev.notice : "",
                 honorRetryAfterMaxMs: Number(cfg.honorRetryAfterMaxMs) || 0,
+                firstTokenTimeout: cfg.firstTokenTimeout || { enabled: true, timeoutMs: 180000 },
               };
             });
           }).catch(function (e) {
             setSnap(function (prev) {
-              return { loading: false, rules: prev.rules, activity: prev.activity, waiting: 0, source: prev.source, error: String((e && e.message) || e), notice: prev.notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs };
+              return { loading: false, rules: prev.rules, activity: prev.activity, waiting: 0, source: prev.source, error: String((e && e.message) || e), notice: prev.notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout };
             });
           });
         }
@@ -143,6 +156,9 @@ window.__ModuleLoader__.load({
         var dirty = draft !== null;
         var honorMs = honorDraft !== null ? honorDraft : snap.honorRetryAfterMaxMs;
         var honorDirty = honorDraft !== null;
+        var first = firstDraft !== null ? firstDraft : snap.firstTokenTimeout;
+        var firstDirty = firstDraft !== null;
+        var dirtyTotal = dirty || honorDirty || firstDirty;
 
         function base() { return cloneRules(draft !== null ? draft : snap.rules); }
         function updateRow(i, field, value) {
@@ -157,17 +173,17 @@ window.__ModuleLoader__.load({
         }
         function addRow() { setDraft(function () { var b = base(); b.push({ code: "", delayMs: 60000, maxRetries: 10 }); return b; }); }
         function removeRow(i) { setDraft(function () { var b = base(); b.splice(i, 1); return b; }); }
-        function setNotice(notice) { setSnap(function (prev) { return { loading: false, rules: prev.rules, activity: prev.activity, waiting: prev.waiting, source: prev.source, error: "", notice: notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs }; }); }
+        function setNotice(notice) { setSnap(function (prev) { return { loading: false, rules: prev.rules, activity: prev.activity, waiting: prev.waiting, source: prev.source, error: "", notice: notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout }; }); }
         function save() {
           var payload = rows
             .filter(function (r) { return String(r.code).trim() !== ""; })
             .map(function (r) { return { code: String(r.code).trim(), delayMs: r.delayMs, maxRetries: r.maxRetries }; });
-          postRules(payload, honorMs).then(function (res) {
-            if (res && res.ok) { setDraft(null); setHonorDraft(null); setNotice("已保存，立即生效并持久化"); pull(true); }
+          postRules(payload, honorMs, first).then(function (res) {
+            if (res && res.ok) { setDraft(null); setHonorDraft(null); setFirstDraft(null); setNotice("已保存，立即生效并持久化"); pull(true); }
             else { setNotice("保存失败：" + ((res && res.error) || "未知错误")); }
           }).catch(function (e) { setNotice("保存失败：" + String((e && e.message) || e)); });
         }
-        function discard() { setDraft(null); setHonorDraft(null); }
+        function discard() { setDraft(null); setHonorDraft(null); setFirstDraft(null); }
 
         try {
           var e = React.createElement;
@@ -177,6 +193,7 @@ window.__ModuleLoader__.load({
           children.push(e("div", { style: S.meta, key: "m" }, snap.loading ? "加载中…" : (
             "当前生效：" + (snap.rules.length ? snap.rules.map(function (r) { return r.code + " → " + Math.round(r.delayMs / 1000) + "s ×" + r.maxRetries; }).join("；") : "无规则（全部交给内置策略）")
             + " ｜ Retry-After 上限 " + (snap.honorRetryAfterMaxMs === 0 ? "已忽略" : Math.round(snap.honorRetryAfterMaxMs / 1000) + "s")
+            + " ｜ 首字超时 " + (first.enabled === false ? "已关闭" : Math.round(first.timeoutMs / 1000) + "s")
             + " ｜ 来源：" + (snap.source === "file" ? "本界面保存" : "cordis.patch.yml 默认值")
           )));
           if (snap.waiting > 0) children.push(e("div", { style: S.warn, key: "w" }, "当前有 " + snap.waiting + " 个请求正在休眠等待重试…"));
@@ -200,8 +217,8 @@ window.__ModuleLoader__.load({
           children.push(e("table", { style: S.table, key: "tbl" }, head, e("tbody", null, bodyRows)));
           children.push(e("div", { style: S.toolbar, key: "bar" },
             e("button", { style: S.btn, onClick: addRow }, "＋ 添加错误码"),
-            (dirty || honorDirty) ? e("button", { style: S.primary, key: "save", onClick: save }, "保存（立即生效）") : null,
-            (dirty || honorDirty) ? e("button", { style: S.btn, key: "discard", onClick: discard }, "放弃修改") : null));
+            (dirtyTotal) ? e("button", { style: S.primary, key: "save", onClick: save }, "保存（立即生效）") : null,
+            (dirtyTotal) ? e("button", { style: S.btn, key: "discard", onClick: discard }, "放弃修改") : null));
           children.push(e("div", { style: S.settings, key: "st" },
             e("div", { style: S.settingsTitle, key: "stt" }, "服务端 Retry-After 采信上限"),
             e("div", { style: S.settingsRow, key: "str" },
@@ -218,6 +235,33 @@ window.__ModuleLoader__.load({
               e("span", { style: S.settingsNote, key: "n" }, honorNote(honorMs))),
             e("div", { style: S.settingsHelp, key: "h" },
               "上游对 429 常回 Retry-After: 3600（一小时）。它只会把等待调大、不会缩短你规则里的休眠；超过此上限就按规则自己的节奏走。填 0 = 完全忽略服务端提示。范围 0–3600 秒。")));
+          children.push(e("div", { style: S.settings, key: "ft" },
+            e("div", { style: S.settingsTitle, key: "ftt" }, "首字超时"),
+            e("div", { style: S.settingsRow, key: "ftr" },
+              e("label", { key: "ftl", style: { display: "flex", alignItems: "center", gap: "6px", fontSize: "13px" } },
+                e("input", {
+                  type: "checkbox",
+                  checked: first.enabled !== false,
+                  onChange: function (ev) {
+                    var on = ev.target.checked;
+                    setFirstDraft({ enabled: on, timeoutMs: first.timeoutMs });
+                  },
+                }),
+                e("span", null, "启用")),
+              e("input", {
+                type: "number", min: "1", max: "3600", step: "1",
+                style: Object.assign({}, S.input, { width: "90px", marginLeft: "10px" }),
+                value: Math.round(first.timeoutMs / 1000),
+                disabled: first.enabled === false,
+                onChange: function (ev) {
+                  var sec = Math.min(3600, Math.max(1, Math.round(parseFloat(ev.target.value) || 0)));
+                  setFirstDraft({ enabled: first.enabled !== false, timeoutMs: sec * 1000 });
+                },
+              }),
+              e("span", { style: S.unit, key: "u" }, "秒"),
+              e("span", { style: S.settingsNote, key: "n" }, firstNote(first))),
+            e("div", { style: S.settingsHelp, key: "h" },
+              "从发出请求到模型的第一个字（正文、思考、工具调用任一）最多等多久。超过就中断这次请求并按失败上报（机器码 TIMEOUT），可以再加一条规则码 TIMEOUT 让它自动重试。思考型模型很慢时别设太小；填 0 秒不合法，用上面的开关关闭。范围 1–3600 秒。")));
           if (snap.notice !== "") children.push(e("div", { style: snap.notice.indexOf("失败") >= 0 ? S.err : S.ok, key: "n" }, snap.notice));
           if (snap.error !== "") children.push(e("div", { style: S.err, key: "e" }, "宿主接口异常：" + snap.error + "（若插件刚重启稍候自动恢复）"));
           children.push(e("div", { style: S.hint, key: "h" }, "规则码四种形态：① HTTP 状态码（429、500…：匹配 status、code 与 message 中独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER…）；③ 字段=值（如 code=insufficient_quota、type=rate_limit_exceeded：匹配 provider 返回 JSON 字段，含被压平进 message 的响应体）；④ msg~子串（如 msg~finish_reason: error：忽略大小写地子串匹配失败 message，用于 provider 用 finish_reason 终止请求时报的 Provider finish_reason: error，此时既无 status 也只有通用 code PI_AI_ERROR）。多条规则按顺序取第一条命中。次数上限 0~1000。保存持久化到 llm-error-retry.rules.json；删除该文件回落到 cordis.patch.yml 默认规则。"));          children.push(e("div", { style: Object.assign({}, S.title, { marginTop: "14px", fontSize: "13px" }), key: "eh" }, "最近活动"));
@@ -242,6 +286,9 @@ window.__ModuleLoader__.load({
                   + (a.attempts !== undefined ? " · 第 " + a.attempts + " 次" : "")
                   + (a.maxRestartTurns !== undefined ? "/" + a.maxRestartTurns : "")
                   + (a.reason ? " · " + a.reason : "");
+              } else if (a.type === "first-token-timeout") {
+                detail = (a.provider ? a.provider + " · " : "") + (a.model ? a.model + " · " : "")
+                  + "等了 " + Math.round((Number(a.timeoutMs) || 0) / 1000) + "s 没有第一个字";
               } else {
                 detail = (a.failure || "") + " · 规则「" + (a.rule || "") + "」 第 " + (a.retry !== undefined ? a.retry : (a.attempts || "?")) + "/" + (a.maxRetries !== undefined ? a.maxRetries : "?") + " 次"
                   + (a.delayMs !== undefined ? " · 休眠 " + Math.round(a.delayMs / 1000) + "s" : "");
