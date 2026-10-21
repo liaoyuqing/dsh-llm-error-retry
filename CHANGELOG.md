@@ -2,6 +2,14 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半模块文件名带 `vN` 是 DSH config-only HMR 的缓存失效手段（同路径模块不会被重新 import），与产品版本号的对应关系见下。
 
+## 0.16.0 — 2026-10-21
+
+- **修复：重试链序号记在内存里，会把会话写坏到打不开**。v15 用进程内 `counters`（`agent.id -> {epoch, used, retryId}`）记每条 `(turn, step, provider, policyKey)` 链重试到第几次；以下任一情况都会让它归零：`agent/disposed` 删条目、进程重建、`epoch`（provider/turn/step）变化、设置页保存规则后的 `counters.clear()`。归零后同一条链会接着写出 `retry: 1` + **新** retryId，而宿主读侧（`session-format-v3-to-v4` 的 `relationships`）要求同一策略链 `retry` 严格 +1、`retryId` 恒定，于是**整个会话打不开**，报 `llm/retry skips its policy attempt sequence`（2026-10-21 实测两个会话因此损坏，只能逐事件修日志才恢复）。
+  - **修法**：序号与 retryId 一律由 `deriveRetryChain()` 从会话日志现场续——扫本会话 `llm/retry` 事件中同链的最后一条，取 `retry + 1`、沿用其 `retryId`；链不存在则 `1` + 新 id。日志是唯一持久事实来源，内存存不存、进程在不在都不影响结果。
+  - 顺带删掉 `counters` / `epoch` / `state.used` / 两处 `counters.clear()` / `agent/disposed` 清理。
+  - `llm/retry-started` 加前置条件：只有 `llm/retry` 确实落盘才补 started（读侧要求 started 有配对的调度事件）；读不到日志（`session.ownEvents()` 抛错）时两个事件都不写并 warn——续不上号宁可少一张重试卡片，也不能写出第二条从 1 开始的链。
+- 宿主半：`host.v18.mjs`（`v16`/`v17` 是同版草稿，占过 HMR 缓存位即弃；改宿主半内容必须换文件名才会被重新 import）。
+
 ## 0.15.0 — 2026-10-21
 
 - **新增首字超时**（`firstTokenTimeout`，默认 180s，设置分区可改）。请求发出后超过设定时间仍没有任何内容增量（正文 / **思考** / 工具调用任一都算），就中断这次请求并报超时。

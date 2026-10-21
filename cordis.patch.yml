@@ -5,7 +5,7 @@
 # 想固定改 YAML：在 ~/.dsh/cordis.patch.yml 加同 id 行整体覆盖 config（HOME 层优先于 bundle 层）。
 - insert:
     - id: llm-error-retry
-      name: ./host.v15.mjs
+      name: ./host.v18.mjs
       config:
         # 服务端 Retry-After 提示最多被采信多久（毫秒）。0 = 完全忽略提示、只按规则节奏。
         honorRetryAfterMaxMs: 60000

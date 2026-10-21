@@ -119,7 +119,7 @@ firstTokenTimeout:
 
 ## 工作原理
 
-- **宿主半**（`host.v15.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子；首字超时走 `llm/stream` waterfall（包一层异步生成器，到点产出合成的 TIMEOUT finish chunk）。
+- **宿主半**（`host.v18.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链，且链号与 retryId 一律从会话日志续，不存进程内存），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子；首字超时走 `llm/stream` waterfall（包一层异步生成器，到点产出合成的 TIMEOUT finish chunk）。
 - **浏览器半**（`client.js`）：DSH 的双拼包机制——`package.json` 声明 `dsh.client.platform=web` + `exports["./client"]`，宿主 client-modules 扫描到后把 bundle 并入 GUI 启动图（`window.__ModuleLoader__.load` 注册协议，与官方打包产物一致），在浏览器端注册 `settings.section` 设置分区。数据面走宿主 `webServer` 路由 `/llm-error-retry/api/config`（同源 fetch）。
 
 ## 二次开发注意（DSH 平台怪癖清单）
@@ -129,6 +129,7 @@ firstTokenTimeout:
 - `webServer` 用 `ctx.inject(['webServer'], …)` 异步等待 + `register` 失败轮询重试：冷启动时 HOME 补丁层先于 webserver 挂载；bundle 层同样存在新旧 fiber 交叠的 duplicate-route 窗口。headless profile 无 webServer → 仅无界面，重试逻辑不受影响。
 - 用户配置绝不能写进包目录（pnpm store 升级即替换）→ 数据目录在 `~/.dsh/llm-error-retry/`。
 - 行为回归用「假 agent + 假 session」探针：`ctx.waterfall('agent/request-error', payload, next)` 触发真实监听链，`session.append` 用收集器承接，零污染真实会话。
+- **读侧会校验的时序状态绝不能存进程内存**（v16 教训）：`llm/retry` / `llm/retry-started` 的 `retry`、`retryId` 有跨事件不变量（同链 `retry` 严格 +1、`retryId` 恒定），而 `agent/disposed`、进程重建、规则保存都可能清掉内存计数——一旦清空就会写出第二条从 1 开始的链，宿主读侧直接拒绝**整个会话**（`llm/retry skips its policy attempt sequence`），日志只能逐事件修。这类字段一律从会话日志续（`session.ownEvents()` 扫同链最后一条），日志是唯一事实来源。
 
 ## 常见问题
 
