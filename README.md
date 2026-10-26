@@ -36,12 +36,12 @@ dsh plugin --profile web remove dsh-llm-error-retry # 卸载
 
 ### 手动安装（不经过 pnpm 的兜底方式）
 
-把仓库文件（`host.v19.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
+把仓库文件（`host.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
 
 ```yaml
 - insert:
     - id: llm-error-retry
-      name: ./plugins/llm-error-retry-ui/host.v19.mjs
+      name: ./plugins/llm-error-retry-ui/host.mjs
       config:
         rules:
           - code: '429'
@@ -140,12 +140,12 @@ notMultimodal:
 
 ## 工作原理
 
-- **宿主半**（`host.v19.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链，且链号与 retryId 一律从会话日志续，不存进程内存），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子；首字超时走 `llm/stream` waterfall（包一层异步生成器，到点产出合成的 TIMEOUT finish chunk）；「不支持多模态」在同一个 `agent/request-error` 钩子上抢先处理（注入提示后 next() 放行）。
+- **宿主半**（`host.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链，且链号与 retryId 一律从会话日志续，不存进程内存），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子；首字超时走 `llm/stream` waterfall（包一层异步生成器，到点产出合成的 TIMEOUT finish chunk）；「不支持多模态」在同一个 `agent/request-error` 钩子上抢先处理（注入提示后 next() 放行）。
 - **浏览器半**（`client.js`）：DSH 的双拼包机制——`package.json` 声明 `dsh.client.platform=web` + `exports["./client"]`，宿主 client-modules 扫描到后把 bundle 并入 GUI 启动图（`window.__ModuleLoader__.load` 注册协议，与官方打包产物一致），在浏览器端注册 `settings.section` 设置分区。数据面走宿主 `webServer` 路由 `/llm-error-retry/api/config`（同源 fetch）。
 
 ## 二次开发注意（DSH 平台怪癖清单）
 
-- **宿主半代码改动必须换文件名**（`host.vN.mjs`，同步 `package.json exports["."]` 与补丁行 name）：DSH 的 config-only HMR 只热更配置，不重载同路径 ESM 模块；只改 `client.js` 无需改名（每次重组重读字节）。
+- **宿主半代码改动需要让 Loader 重新 import 该模块**：DSH 的 config-only HMR 只热更配置，不重载同路径 ESM 模块（Loader 用文件路径作模块缓存键，同路径必然沿用旧模块）。改完 `host.mjs` 后重启该 profile 即可；只想热重载就临时改补丁行里该条目的 `id` 再改回（**只改 `config` 不算**）。只改 `client.js` 无需如此（每次重组重读字节）。
 - 宿主 HTTP 响应**绝不自带 `Content-Length`**（`statusCode + setHeader + res.end`）：web profile 的 gzip 中间件（阈值 1024B）与 `writeHead` 钉死的 CL 冲突，压缩后浏览器会丢弃整个响应体。
 - `webServer` 用 `ctx.inject(['webServer'], …)` 异步等待 + `register` 失败轮询重试：冷启动时 HOME 补丁层先于 webserver 挂载；bundle 层同样存在新旧 fiber 交叠的 duplicate-route 窗口。headless profile 无 webServer → 仅无界面，重试逻辑不受影响。
 - 用户配置绝不能写进包目录（pnpm store 升级即替换）→ 数据目录在 `~/.dsh/llm-error-retry/`。

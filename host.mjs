@@ -1,7 +1,13 @@
 /**
- * llm-error-retry v15 — 大模型请求错误「休眠后重试」宿主插件（DSH Profile Bundle 化）。
+ * llm-error-retry — 大模型请求错误「休眠后重试」宿主插件（DSH Profile Bundle 化）。
  *
- * 相比 v14：新增「首字超时」（first-token timeout）。请求发出后若在设定时间内没有收到
+ * 宿主半始终是**这一个文件**（host.mjs），不再按版本改名。DSH 的模块热重载靠
+ * HMR 监视目录：把插件所在目录加入 `hmr.config.root` 后，就地改这个文件即可热重载，
+ * 无需再复制成 host.v2.mjs / host.v3.mjs…（旧做法是换文件名绕过 ESM 缓存，代价是
+ * 目录里堆满历史版本）。装插件时用包名（dsh-llm-error-retry）而不是文件路径，
+ * 让它经 profile 的 node_modules 软链解析到真实目录。
+ *
+ * 相比 v15：新增「首字超时」（first-token timeout）。请求发出后若在设定时间内没有收到
  * 模型的第一个输出（文本 / 思考 / 工具调用都算输出），判定上游卡死，中断本次请求并按
  * 机器码 TIMEOUT 上报，让下面那套规则引擎接手（有 TIMEOUT 规则就休眠重试，没有就直接
  * 结束本轮并在聊天区显示超时）。
@@ -68,24 +74,9 @@
  *   - 防跑飞：每轮「截断→续写→又截断」以 maxContinues 次封顶；续写若没有写出任何
  *     新文本（模型在同一位置原地空转），立即停止并记录会话事件。工具步接力不受此限。
  *
- * 相比 v7：新增第四种规则码形态 'msg~子串'（忽略大小写地子串匹配 failure.message）。
- *
- * 规则码四形态（按顺序取第一条命中）：
- *   - 数字 '429'：匹配 failure.status、failure.code（'429'/'HTTP_429'）、
- *     message 中的独立数字（pi-ai 类适配器会把 HTTP 状态压平进 message）。
- *   - 机器码 'RATE_LIMIT'/'QUOTA'…：匹配 failure.code（忽略大小写）。
- *   - '字段=值'（如 code=insufficient_quota）：匹配 provider 返回 JSON 字段：
- *     ① failure.<字段> 标量属性；② message 内嵌 {...} JSON 解析；③ 宽松文本 "字段":"值"。
- *   - 'msg~子串'（如 msg~finish_reason: error）：子串匹配 failure.message。
- *     用于没有 status、code 又被归到通用桶的失败：provider 在 SSE 里以未识别的
- *     finish_reason 终止流时，pi-ai 报成 message='Provider finish_reason: <值>'、
- *     code='PI_AI_ERROR'（openai-completions.js 的 mapStopReason），前三种形态都命中不了。
- *
- * 命中 → 休眠 delayMs → {kind:'retry'} 重新请求；每规则独立 maxRetries，
- * 耗尽即上报；prepend 优先于内置 llm-retry；按 provider/turn/step 计数重置；
- * Retry-After 更长时按提示推迟，但不超过 honorRetryAfterMaxMs（默认 60s，因为
- * 上游常回 `Retry-After: 3600`，照做会让会话整小时不动）；休眠/重试经 'llm/retry' +
- * 'llm/retry-started' 会话事件对显示为聊天区重试卡片。
+ * 相比 v7：重试链序号不再记在进程内存里（换个会话就读不出「第几次」），改为从会话
+ * 日志续——扫同一 session 已持久化的 llm/retry-started 事件得出链号与 retryId，
+ * 会话因此可以被正常打开、重放。
  *
  * 配置来源（高→低）：<数据目录>/rules.json（界面保存）→ 补丁行 config.rules → 默认 429×60s×10。
  * 界面：GUI「设置」→「LLM 错误重试」；备用页 http://127.0.0.1:3080/llm-error-retry
@@ -121,6 +112,25 @@ const MIN_FIRST_TOKEN_TIMEOUT_MS = 1_000
 const MAX_FIRST_TOKEN_TIMEOUT_MS = 3_600_000
 /** 算作「模型已经开口」的 chunk：文本、思考、工具调用增量都算输出。 */
 const FIRST_TOKEN_CHUNKS = new Set(['text-delta', 'reasoning-delta', 'tool-call-delta'])
+/**
+ * 「当前模型不支持多模态」失败的兜底：不把这次失败直接抛给用户，而是往会话上下文里
+ * 追加一条模型可见的自动提示，告诉模型图片用不了、改用文字继续，然后放行给下游
+ * （model-failover 会因此把该模型标记为失败并切换到组内支持多模态的模型重试）。
+ *   - 为什么不在本插件内直接重试同一模型：请求里的图片还在，换个口气重发必然同样失败，
+ *     只会白烧一步并再写一条提示，把上下文越堆越脏。
+ *   - maxNotices 限制每轮最多注入几条，防止模型被判定失败后仍被反复路由回来。
+ */
+const DEFAULT_NOT_MULTIMODAL = {
+  enabled: true,
+  maxNotices: 1,
+  text: '【自动提示】上一条请求没有送达：当前模型不支持多模态（图片）输入。请不要依赖图片，改用文字、坐标、文件内容或工具返回的文字描述继续当前任务；确实需要看图时，请切换到支持多模态的模型。',
+}
+/** 每轮最多注入几条提示的上限。 */
+const MAX_NOTICES_LIMIT = 10
+/** 上游「模型不支持多模态」的文案判定（各网关措辞略有差异，只认核心短语）。 */
+const NOT_MULTIMODAL_PATTERN = /not[\s_-]*multimodal/i
+/** 自动提示消息的来源标记（区分人工输入与插件注入）。 */
+const NOTICE_SOURCE = 'llm-error-retry-notice'
 /** 自动续写注入消息的来源标记（区分人工输入与插件注入）。 */
 const CONTINUATION_SOURCE = 'llm-error-retry-continuation'
 const DEFAULT_MAX_TOKENS = {
@@ -144,6 +154,45 @@ function shortId(agentId) {
   const text = String(agentId)
   const stripped = text.startsWith('session-') ? text.slice(8) : text
   return stripped.slice(0, 8)
+}
+
+/**
+ * 从会话日志推导同一策略链已有的最大 retry 与 retryId。
+ *
+ * 读侧（session-format-v3-to-v4 的 relationships）要求同一
+ * (turn, step, provider, policyKey) 链上 retryId 恒定、retry 严格 +1。内存计数一旦归零
+ * （agent/disposed、进程重建、epoch 变化、规则保存后清空）就会把同一条链重新写成
+ * retry=1 + 新 retryId，整个会话因此打不开，只能从日志本身续号。
+ *
+ * @param session - 本次请求所属的会话（日志是唯一的持久事实来源）。
+ * @param turn - 当前轮次。
+ * @param step - 当前步。
+ * @param provider - 当前请求的 provider。
+ * @param policyKey - 本插件写出的策略键（含规则码）。
+ * @returns 该链已有的 retry（无则 0）、retryId（无则 undefined），以及日志是否读得到。
+ *   readable=false 时调用方不得写 llm/retry：续不上号就会写坏重试链。
+ */
+function deriveRetryChain(session, turn, step, provider, policyKey) {
+  let retry = 0
+  let retryId
+  let events
+  try {
+    events = session.ownEvents()
+  } catch (error) {
+    // 读不到日志就没法续号：调用方据此**不写**会话事件，否则会重演本函数要防的
+    // 「同一条链重新从 retry=1 开始」，整个会话因此打不开。
+    return { retry, retryId, readable: false, reason: String((error && error.message) || error) }
+  }
+  for (const event of events) {
+    if (event === null || typeof event !== 'object' || event.type !== 'llm/retry') continue
+    const data = event.data
+    if (data === null || typeof data !== 'object') continue
+    if (data.turn !== turn || data.step !== step) continue
+    if (String(data.provider) !== String(provider) || data.policyKey !== policyKey) continue
+    if (typeof data.retry === 'number' && Number.isFinite(data.retry) && data.retry > 0) retry = data.retry
+    if (typeof data.retryId === 'string' && data.retryId.length > 0) retryId = data.retryId
+  }
+  return { retry, retryId, readable: true }
 }
 
 /** Parse one rule code string into its matcher shape. */
@@ -258,6 +307,41 @@ export function validateFirstTokenTimeout(input) {
     throw new Error(`llm-error-retry: firstTokenTimeout.timeoutMs must be a number within ${MIN_FIRST_TOKEN_TIMEOUT_MS}..${MAX_FIRST_TOKEN_TIMEOUT_MS}`)
   }
   return { enabled, timeoutMs }
+}
+
+/**
+ * Validate the `notMultimodal` deployment setting.
+ * @param {unknown} input - raw value from the patch row or rules file.
+ * @returns {{ enabled: boolean, maxNotices: number, text: string }} a resolved setting.
+ * @throws {Error} when a supplied value is of the wrong type or out of range.
+ */
+export function validateNotMultimodal(input) {
+  if (input === undefined || input === null) return { ...DEFAULT_NOT_MULTIMODAL }
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('llm-error-retry: notMultimodal must be an object of { enabled, maxNotices, text }')
+  }
+  const enabled = input.enabled === undefined ? DEFAULT_NOT_MULTIMODAL.enabled : input.enabled
+  if (typeof enabled !== 'boolean') throw new Error('llm-error-retry: notMultimodal.enabled must be a boolean')
+  const maxNotices = input.maxNotices === undefined ? DEFAULT_NOT_MULTIMODAL.maxNotices : Number(input.maxNotices)
+  if (!Number.isInteger(maxNotices) || maxNotices < 1 || maxNotices > MAX_NOTICES_LIMIT) {
+    throw new Error(`llm-error-retry: notMultimodal.maxNotices must be an integer within 1..${MAX_NOTICES_LIMIT}`)
+  }
+  const text = input.text === undefined ? DEFAULT_NOT_MULTIMODAL.text : input.text
+  if (typeof text !== 'string' || text.trim().length === 0) {
+    throw new Error('llm-error-retry: notMultimodal.text must be a non-empty string')
+  }
+  return { enabled, maxNotices, text }
+}
+
+/**
+ * 判断一次失败是不是「当前模型不支持多模态」。
+ * @param {unknown} failure - the normalized LlmFailure carried by the event.
+ * @returns {boolean} true when the upstream rejected the request for lack of multimodal support.
+ */
+function isNotMultimodalFailure(failure) {
+  if (failure === null || typeof failure !== 'object') return false
+  const message = typeof failure.message === 'string' ? failure.message : ''
+  return NOT_MULTIMODAL_PATTERN.test(message)
 }
 
 function validateRules(input) {
@@ -425,6 +509,16 @@ function renderPage() {
     </div>
     <div class="settings-help">请求发出后，若这段时间内没有收到模型的任何输出（文本、思考、工具调用都算输出），就中断本次请求并上报错误码 <code>TIMEOUT</code>。规则表里若有 <code>TIMEOUT</code> 规则，会按该规则休眠后自动重试；没有则本轮直接以失败结束，聊天区显示超时。范围 1–3600 秒，取消勾选 = 关闭。</div>
   </div>
+  <div class="settings">
+    <div class="settings-title">模型不支持多模态时（图片传给纯文本模型）</div>
+    <div class="settings-row">
+      <label style="display:flex;align-items:center;gap:6px"><input id="nm-enabled" type="checkbox"> 自动往上下文注入提示</label>
+      <input id="nm-max" type="number" min="1" max="10" step="1">
+      <span class="unit">条/轮</span>
+      <span id="nm-note" class="settings-note"></span>
+    </div>
+    <div class="settings-help">上游回 <code>The request model is not multimodal</code> 时不直接把错误抛给用户：先往会话里追加一条模型可见的自动提示，告诉模型图片读不了、改用文字或工具返回的描述继续，然后让模型路由（model-failover）把该模型标记为失败、换到组内支持多模态的模型重试。本插件不会对同一模型重试——请求里的图片还在，重发必然同样失败。范围 1–10 条，取消勾选 = 关闭（恢复直接报错）。</div>
+  </div>
   <div class="hint">规则码四种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）；④ <b>msg~子串</b>（如 <code>msg~finish_reason: error</code>：忽略大小写地子串匹配失败 message，用于没有 status、只有一句文本的失败，例如 provider 用 finish_reason 终止请求时的 <code>Provider finish_reason: error</code>）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~1000（0 = 命中即上报）。服务端 Retry-After 更长时按提示推迟，但会被下方「服务端 Retry-After 采信上限」截断——上游的 <code>Retry-After: 3600</code> 不会让你等满一小时。休眠/重试过程显示在会话框重试卡片中。保存写入 ~/.dsh/llm-error-retry/rules.json 并立即生效；删除该文件回落到 cordis.patch.yml 默认规则。</div>
   <div class="sub" style="margin-top:18px"><b>最近活动</b></div>
   <ul id="events"><li>加载中…</li></ul>
@@ -435,6 +529,8 @@ function renderPage() {
   var honorMs = 60000;
   var ftEnabled = true;
   var ftMs = 180000;
+  var nmEnabled = true;
+  var nmMax = 1;
   function $(id) { return document.getElementById(id); }
   function setNotice(text, cls) { var n = $('notice'); n.textContent = text; n.className = 'notice' + (cls ? ' ' + cls : ''); }
   function markDirty() { dirty = true; }
@@ -459,6 +555,15 @@ function renderPage() {
     $('ft-enabled').checked = ftEnabled;
     $('ft-seconds').value = Math.round(ftMs / 1000);
     $('ft-note').textContent = ftNote(ftMs, ftEnabled);
+  }
+  function nmNote(enabled, max) {
+    if (!enabled) return '已关闭：直接报错，不注入提示';
+    return '每轮最多注入 ' + max + ' 条，之后仍失败就直接报错';
+  }
+  function renderNotMultimodal() {
+    $('nm-enabled').checked = nmEnabled;
+    $('nm-max').value = nmMax;
+    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
   }
   function renderRows() {
     var tb = $('rows'); tb.innerHTML = '';
@@ -489,7 +594,7 @@ function renderPage() {
   function renderEvents(list) {
     var ul = $('events'); ul.innerHTML = '';
     if (!list || list.length === 0) { var li0 = document.createElement('li'); li0.textContent = '暂无记录'; ul.appendChild(li0); return; }
-    var labels = { mounted: '挂载', sleeping: '休眠等待中', retrying: '已重新发起请求', cancelled: '休眠被取消', exhausted: '预算耗尽，错误上报', saved: '配置已保存', continuation: '已自动续写', 'continuation-exhausted': '续写次数用尽', 'continuation-stalled': '续写无进展已停止', restart: '已自动重开新轮', 'restart-exhausted': '重开新轮次数用尽', 'restart-stalled': '无实质推进未重开', 'first-token-timeout': '首字超时已中断' };
+    var labels = { mounted: '挂载', sleeping: '休眠等待中', retrying: '已重新发起请求', cancelled: '休眠被取消', exhausted: '预算耗尽，错误上报', saved: '配置已保存', continuation: '已自动续写', 'continuation-exhausted': '续写次数用尽', 'continuation-stalled': '续写无进展已停止', restart: '已自动重开新轮', 'restart-exhausted': '重开新轮次数用尽', 'restart-stalled': '无实质推进未重开', 'first-token-timeout': '首字超时已中断', 'not-multimodal': '不支持多模态，已注入提示', 'not-multimodal-skip': '不支持多模态，已达提示上限' };
     list.slice(0, 12).forEach(function (e) {
       var li = document.createElement('li');
       var t = new Date(e.at).toLocaleTimeString();
@@ -503,6 +608,8 @@ function renderPage() {
         body = '第 ' + (e.turn !== undefined ? e.turn : '?') + ' 轮 · max-tokens 收尾 · 第 ' + (e.attempts !== undefined ? e.attempts : '?') + ' 次' + (e.maxRestartTurns !== undefined ? '/' + e.maxRestartTurns : '')
       } else if (e.type === 'first-token-timeout') {
         body = (e.provider || '?') + '/' + (e.model || '?') + ' · ' + Math.round((e.timeoutMs || 0) / 1000) + 's 内无任何输出'
+      } else if (e.type === 'not-multimodal' || e.type === 'not-multimodal-skip') {
+        body = (e.provider || '?') + ' · 第 ' + (e.notices !== undefined ? e.notices : '?') + ' 条'
       } else {
         body = e.failure + ' · 规则「' + e.rule + '」 第 ' + (e.retry || e.attempts || '?') + '/' + (e.maxRetries != null ? e.maxRetries : '?') + ' 次 · 休眠 ' + Math.round((e.delayMs || 0) / 1000) + 's'
       }
@@ -516,6 +623,9 @@ function renderPage() {
       + ' ｜ 首字超时 ' + (state.firstTokenTimeout && state.firstTokenTimeout.enabled === false
           ? '已关闭'
           : Math.round(Number(state.firstTokenTimeout && state.firstTokenTimeout.timeoutMs) || 0) / 1000 + 's')
+      + ' ｜ 多模态提示 ' + (state.notMultimodal && state.notMultimodal.enabled === false
+          ? '已关闭'
+          : (Number(state.notMultimodal && state.notMultimodal.maxNotices) || 0) + ' 条/轮')
       + ' ｜ 来源：' + (state.source === 'file' ? '界面保存文件' : 'cordis.patch.yml 默认值')
       + (state.waiting > 0 ? ' ｜ 正在休眠等待: ' + state.waiting : '');
     if (state.waiting > 0) setNotice('有 ' + state.waiting + ' 个请求正在休眠等待重试…', 'warn');
@@ -535,6 +645,12 @@ function renderPage() {
         ftEnabled = ft.enabled !== false;
         ftMs = Number(ft.timeoutMs) || 180000;
         renderFirstToken();
+      }
+      if (!keepDraft || !dirty) {
+        var nm = state.notMultimodal || {};
+        nmEnabled = nm.enabled !== false;
+        nmMax = Number(nm.maxNotices) || 1;
+        renderNotMultimodal();
       }
       applyState(state);
     }).catch(function (e) { setNotice('读取失败：' + e, 'err'); });
@@ -556,6 +672,17 @@ function renderPage() {
     $('ft-note').textContent = ftNote(ftMs, ftEnabled);
     markDirty();
   };
+  $('nm-enabled').onchange = function () {
+    nmEnabled = $('nm-enabled').checked;
+    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
+    markDirty();
+  };
+  $('nm-max').oninput = function () {
+    var n = Math.min(10, Math.max(1, Math.round(parseFloat($('nm-max').value) || 0)));
+    nmMax = n;
+    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
+    markDirty();
+  };
   $('add').onclick = function () { rows.push({ code: '', delayMs: 60000, maxRetries: 10 }); markDirty(); renderRows(); };
   $('revert').onclick = function () { dirty = false; refresh(false); setNotice('已放弃本地修改', 'ok'); };
   $('save').onclick = function () {
@@ -563,6 +690,7 @@ function renderPage() {
       rules: rows.filter(function (r) { return String(r.code).trim() !== ''; }).map(function (r) { return { code: String(r.code).trim(), delayMs: r.delayMs, maxRetries: r.maxRetries }; }),
       honorRetryAfterMaxMs: honorMs,
       firstTokenTimeout: { enabled: ftEnabled, timeoutMs: ftMs },
+      notMultimodal: { enabled: nmEnabled, maxNotices: nmMax },
     };
     fetch('/llm-error-retry/api/config', { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
       .then(function (res) {
@@ -603,6 +731,7 @@ export function apply(ctx, config = {}) {
   const maxTokens = validateMaxTokens(config.maxTokens)
   const yamlHonorRetryAfter = validateHonorRetryAfter(config.honorRetryAfterMaxMs)
   const yamlFirstToken = validateFirstTokenTimeout(config.firstTokenTimeout)
+  const yamlNotMultimodal = validateNotMultimodal(config.notMultimodal)
 
   let rules = yamlRules
   let rulesSource = 'yaml-default'
@@ -610,9 +739,9 @@ export function apply(ctx, config = {}) {
   let honorRetryAfterMaxMs = yamlHonorRetryAfter
   /** 首字超时：界面保存值优先于补丁行，保存后即时生效。 */
   let firstTokenTimeout = yamlFirstToken
+  /** 不支持多模态时的自动提示：界面保存值优先于补丁行，保存后即时生效。 */
+  let notMultimodal = yamlNotMultimodal
 
-  /** agentId -> { epoch, used: Map<ruleTag, number>, retryId: string | undefined } */
-  const counters = new Map()
   /** 活跃休眠的唤醒回调：finish(value) */
   const waiters = new Set()
   /** 最近事件环形缓冲（新在前） */
@@ -622,7 +751,7 @@ export function apply(ctx, config = {}) {
 
   function loadRulesFile() {
     try {
-      if (!existsSync(rulesFile)) { rules = yamlRules; rulesSource = 'yaml-default'; honorRetryAfterMaxMs = yamlHonorRetryAfter; firstTokenTimeout = yamlFirstToken; return }
+      if (!existsSync(rulesFile)) { rules = yamlRules; rulesSource = 'yaml-default'; honorRetryAfterMaxMs = yamlHonorRetryAfter; firstTokenTimeout = yamlFirstToken; notMultimodal = yamlNotMultimodal; return }
       const parsed = JSON.parse(readFileSync(rulesFile, 'utf8'))
       rules = validateRules(parsed.rules)
       // 设置单独校验：坏值只忽略它自己，不连累规则整体回落到 yaml 默认。
@@ -632,11 +761,15 @@ export function apply(ctx, config = {}) {
       if (parsed.firstTokenTimeout !== undefined) {
         try { firstTokenTimeout = validateFirstTokenTimeout(parsed.firstTokenTimeout) } catch {}
       }
+      if (parsed.notMultimodal !== undefined) {
+        try { notMultimodal = validateNotMultimodal(parsed.notMultimodal) } catch {}
+      }
       rulesSource = 'file'
     } catch (error) {
       rules = yamlRules
       honorRetryAfterMaxMs = yamlHonorRetryAfter
       firstTokenTimeout = yamlFirstToken
+      notMultimodal = yamlNotMultimodal
       rulesSource = 'yaml-default（覆盖文件被忽略：' + String((error && error.message) || error) + '）'
     }
   }
@@ -652,10 +785,11 @@ export function apply(ctx, config = {}) {
         status: 'mounted',
         mountedAt: new Date().toISOString(),
         pid: process.pid,
-        version: '0.15.0',
+        version: '0.18.0',
         rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
         rulesSource,
         firstTokenTimeout,
+        notMultimodal,
         ui: UI_PATH,
         waiting: waiters.size,
         lastEvents: recent,
@@ -685,21 +819,57 @@ export function apply(ctx, config = {}) {
     waiters.add(finish)
   })
 
+  // 「当前模型不支持多模态」：不把这次失败直接抛给用户，而是往会话上下文里追加一条
+  // 模型可见的自动提示（告诉模型图片读不了、改用文字继续），再放行给下游——model-failover
+  // 会因此把该模型标记为失败并切换到组内支持多模态的模型重试。
+  // 不在本插件内重试同一模型：请求里的图片还在，重发必然同样失败。
+  /** agentId -> { turn, count }：按轮计数，换轮自动归零。 */
+  const notMultimodalNotices = new Map()
+
+  const noteNotMultimodal = (agent, turn, provider, failure) => {
+    if (!notMultimodal.enabled) return false
+    if (!isNotMultimodalFailure(failure)) return false
+    const agentId = String(agent.id)
+    const state = notMultimodalNotices.get(agentId)
+    const count = state !== undefined && state.turn === turn ? state.count : 0
+    if (count >= notMultimodal.maxNotices) {
+      record({ type: 'not-multimodal-skip', agent: shortId(agentId), provider, notices: count })
+      ctx.logger.info(`llm-error-retry: 本轮已注入 ${count} 条「不支持多模态」提示（上限 ${notMultimodal.maxNotices}），不再重复注入`)
+      return false
+    }
+    try {
+      agent.session.append('user/message', {
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: notMultimodal.text }],
+        source: { kind: NOTICE_SOURCE },
+      }, { surfaceOp: 'append' })
+    } catch (error) {
+      ctx.logger.warn(`llm-error-retry: 注入「不支持多模态」提示失败：${String((error && error.message) || error)}`)
+      return false
+    }
+    notMultimodalNotices.set(agentId, { turn, count: count + 1 })
+    record({ type: 'not-multimodal', agent: shortId(agentId), provider, notices: count + 1 })
+    ctx.logger.info(`llm-error-retry: 上游判定当前模型不支持多模态，已注入自动提示并交给下游换模型（第 ${count + 1}/${notMultimodal.maxNotices} 条）`)
+    return true
+  }
+
   // prepend：置于水流最外层，命中规则的失败先由本插件处理（否决内置快速重试）。
   const disposeListener = ctx.on('agent/request-error', (payload, next) => {
     if (disposed) return next()
     const { agent, turn, step, provider, failure, signal } = payload
+    // 多模态不支持不是「等一等就好」的失败：先注入提示，再原样放行给下游路由换模型。
+    if (noteNotMultimodal(agent, turn, provider, failure)) return next()
     const rule = matchAgainst(rules, failure)
     if (rule === undefined) return next()
 
     const agentId = String(agent.id)
-    const epoch = `${provider}/${turn}/${step}`
-    let state = counters.get(agentId)
-    if (!state || state.epoch !== epoch) {
-      state = { epoch, used: new Map(), retryId: undefined }
-      counters.set(agentId, state)
-    }
-    const attempt = (state.used.get(rule.tag) ?? 0) + 1
+    const policyKey = 'llm-error-retry/' + rule.code
+    // 序号与 retryId 一律从会话日志续，不用内存计数：内存条目会在 agent/disposed、
+    // 进程重建或 epoch 变化时归零，那样同一条链会重新写出 retry=1 + 新 retryId，
+    // 读侧随即拒绝整个会话（llm/retry skips its policy attempt sequence）。
+    const chain = deriveRetryChain(agent.session, turn, step, provider, policyKey)
+    const attempt = chain.retry + 1
     const label = describeFailure(failure)
 
     if (attempt > rule.maxRetries) {
@@ -708,7 +878,6 @@ export function apply(ctx, config = {}) {
       return Promise.resolve(undefined)
     }
 
-    state.used.set(rule.tag, attempt)
     let delayMs = rule.delayMs
     let honorCapped = false
     // 服务端 Retry-After 更长时按提示推迟，但不超过 honorRetryAfterMaxMs：
@@ -729,23 +898,31 @@ export function apply(ctx, config = {}) {
     const entry = record({ type: 'sleeping', agent: shortId(agentId), provider, failure: label, rule: rule.code, retry: attempt, maxRetries: rule.maxRetries, delayMs, ...honorCapped ? { providerRetryAfterMs: hint, cappedBy: honorRetryAfterMaxMs } : {} })
 
     // 会话框原生重试卡片：调度事件在等待前落盘，醒来后补 started。
-    if (state.retryId === undefined) state.retryId = randomUUID()
-    const retryId = state.retryId
-    try {
-      agent.session.append('llm/retry', {
-        retryId,
-        turn,
-        step,
-        provider: String(provider),
-        mode: 'normal',
-        policyKey: 'llm-error-retry/' + rule.code,
-        retry: attempt,
-        maxRetries: rule.maxRetries,
-        delayMs,
-        failure: snapshotFailure(failure ?? {}),
-      })
-    } catch (error) {
-      ctx.logger.warn(`llm-error-retry: llm/retry session append failed: ${String((error && error.message) || error)}`)
+    // 同一条链复用既有 retryId：读侧要求一个策略链只对应一个 id。
+    const retryId = chain.retryId ?? randomUUID()
+    let scheduled = false
+    if (!chain.readable) {
+      // 续不上号就不落盘：写一条从 1 开始的 llm/retry 会让整个会话打不开，
+      // 代价只是这一次失败没有会话内重试卡片。
+      ctx.logger.warn(`llm-error-retry: 读不到会话日志（${chain.reason}），本次重试不写会话事件，避免写坏重试链`)
+    } else {
+      try {
+        agent.session.append('llm/retry', {
+          retryId,
+          turn,
+          step,
+          provider: String(provider),
+          mode: 'normal',
+          policyKey,
+          retry: attempt,
+          maxRetries: rule.maxRetries,
+          delayMs,
+          failure: snapshotFailure(failure ?? {}),
+        })
+        scheduled = true
+      } catch (error) {
+        ctx.logger.warn(`llm-error-retry: llm/retry session append failed: ${String((error && error.message) || error)}`)
+      }
     }
 
     return sleepCancellable(delayMs, signal).then((slept) => {
@@ -753,10 +930,13 @@ export function apply(ctx, config = {}) {
         record({ type: 'cancelled', agent: entry.agent, provider, failure: label, rule: rule.code, retry: attempt, maxRetries: rule.maxRetries })
         return undefined
       }
-      try {
-        agent.session.append('llm/retry-started', { retryId, turn, step, retry: attempt })
-      } catch (error) {
-        ctx.logger.warn(`llm-error-retry: llm/retry-started session append failed: ${String((error && error.message) || error)}`)
+      // 读侧要求 llm/retry-started 必须配对先前的调度事件：调度没落盘就不要补 started。
+      if (scheduled) {
+        try {
+          agent.session.append('llm/retry-started', { retryId, turn, step, retry: attempt })
+        } catch (error) {
+          ctx.logger.warn(`llm-error-retry: llm/retry-started session append failed: ${String((error && error.message) || error)}`)
+        }
       }
       ctx.logger.info(`llm-error-retry: ${label} 休眠结束，重新发起请求（第 ${attempt}/${rule.maxRetries} 次）`)
       record({ type: 'retrying', agent: entry.agent, provider, failure: label, rule: rule.code, retry: attempt, maxRetries: rule.maxRetries })
@@ -770,9 +950,9 @@ export function apply(ctx, config = {}) {
   const continuations = new Map()
 
   const disposeCleanup = ctx.on('agent/disposed', ({ agent }) => {
-    counters.delete(String(agent.id))
     continuations.delete(String(agent.id))
     restarts.delete(String(agent.id))
+    notMultimodalNotices.delete(String(agent.id))
   })
 
   // 记录每个 agent 最近一步的 finish 与累计文本长度。
@@ -1071,6 +1251,7 @@ export function apply(ctx, config = {}) {
           rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
           honorRetryAfterMaxMs,
           firstTokenTimeout,
+          notMultimodal,
           source: rulesSource,
           waiting: waiters.size,
           lastEvents: recent.slice(0, 12),
@@ -1087,17 +1268,21 @@ export function apply(ctx, config = {}) {
         const nextFirstToken = body.firstTokenTimeout === undefined
           ? firstTokenTimeout
           : validateFirstTokenTimeout(body.firstTokenTimeout)
+        const nextNotMultimodal = body.notMultimodal === undefined
+          ? notMultimodal
+          : validateNotMultimodal(body.notMultimodal)
         writeFileSync(rulesFile, JSON.stringify({
           rules: next.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
           honorRetryAfterMaxMs: nextHonor,
           firstTokenTimeout: nextFirstToken,
+          notMultimodal: nextNotMultimodal,
         }, null, 2))
         rules = next
         honorRetryAfterMaxMs = nextHonor
         firstTokenTimeout = nextFirstToken
+        notMultimodal = nextNotMultimodal
         rulesSource = 'file'
-        counters.clear()
-        record({ type: 'saved', source: 'ui', rules: rules.map(({ code, delayMs, maxRetries }) => `${code}->${delayMs}ms x${maxRetries}`), honorRetryAfterMaxMs, firstTokenTimeout: nextFirstToken })
+        record({ type: 'saved', source: 'ui', rules: rules.map(({ code, delayMs, maxRetries }) => `${code}->${delayMs}ms x${maxRetries}`), honorRetryAfterMaxMs, firstTokenTimeout: nextFirstToken, notMultimodal: nextNotMultimodal })
         ctx.logger.info(`llm-error-retry: rules saved via UI -> ${rules.map(({ code, delayMs, maxRetries }) => `${code}->${Math.round(delayMs / 1000)}s x${maxRetries}`).join(', ') || '(none, pass-through)'}; Retry-After 采信上限 ${Math.round(nextHonor / 1000)}s${nextHonor === 0 ? '（忽略服务端提示）' : ''}`)
         sendJson(res, 200, { ok: true })
       } catch (error) {
@@ -1153,6 +1338,5 @@ export function apply(ctx, config = {}) {
     if (routeDisposer !== null) routeDisposer()
     for (const wake of waiters) wake(false)
     waiters.clear()
-    counters.clear()
   }, 'llm-error-retry: unmount listener, UI route, and release pending retry waits')
 }

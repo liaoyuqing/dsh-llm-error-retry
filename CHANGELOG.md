@@ -1,6 +1,13 @@
 # Changelog
 
-本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半模块文件名带 `vN` 是 DSH config-only HMR 的缓存失效手段（同路径模块不会被重新 import），与产品版本号的对应关系见下。
+本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半从 0.18.0 起只有**一个文件** `host.mjs`（此前各版本按 `host.vN.mjs` 发布，`vN` 是 DSH config-only HMR 不重载同路径模块的缓存失效手段，已在 0.18.0 取消——见该版本条目）。
+
+## 0.18.0 — 2026-10-26
+
+- **宿主半收敛为单个文件 `host.mjs`**。此前每改一次宿主半就得复制成 `host.vN.mjs` 绕过 ESM 路径缓存（Loader 用文件路径作模块缓存键，同路径必然沿用旧模块），目录与仓库里因此堆了 11 个历史版本文件（`host.v7`~`host.v19`），且 `package.json` / 补丁行 / 文档 / 校验脚本里的引用都指向某个具体版本号。
+  - 现在 `host.mjs` 是唯一宿主文件，`package.json` 的 `main` / `exports["."]` / `files`、补丁行 `name`、校验脚本与文档全部指向它。
+  - **升级方式变了**：以前换文件名即生效，现在改同一个文件后需要让 Loader 重新 import 该模块（重启该 profile，或临时改补丁行的条目 id 再改回——只改 `config` 属于 config-only 重载，会沿用旧模块）。
+- 宿主半：`host.mjs`（此前为 `host.v19.mjs`）。
 
 ## 0.17.0 — 2026-10-26
 

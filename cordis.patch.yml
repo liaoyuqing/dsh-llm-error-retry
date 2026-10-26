@@ -5,7 +5,7 @@
 # 想固定改 YAML：在 ~/.dsh/cordis.patch.yml 加同 id 行整体覆盖 config（HOME 层优先于 bundle 层）。
 - insert:
     - id: llm-error-retry
-      name: ./host.v19.mjs
+      name: ./host.mjs
       config:
         # 模型不支持多模态时：自动往上下文注入提示，而不是直接报错。
         notMultimodal:
