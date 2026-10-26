@@ -67,10 +67,11 @@ window.__ModuleLoader__.load({
       function getJson() {
         return fetch(API, { credentials: "same-origin", cache: "no-store" }).then(readConfigResponse);
       }
-      function postRules(rules, honorRetryAfterMaxMs, firstTokenTimeout) {
+      function postRules(rules, honorRetryAfterMaxMs, firstTokenTimeout, notMultimodal) {
         var payload = { rules: rules };
         if (honorRetryAfterMaxMs !== undefined) payload.honorRetryAfterMaxMs = honorRetryAfterMaxMs;
         if (firstTokenTimeout !== undefined) payload.firstTokenTimeout = firstTokenTimeout;
+        if (notMultimodal !== undefined) payload.notMultimodal = notMultimodal;
         return fetch(API, {
           method: "POST", credentials: "same-origin", cache: "no-store",
           headers: { "content-type": "application/json" },
@@ -102,6 +103,11 @@ window.__ModuleLoader__.load({
         if (s <= 300) return "偏严格：多数请求能过，思考很长的会超时";
         return "宽松：给长思考留足时间";
       }
+      /** 多模态提示的即时说明。 */
+      function nmNote(cfg) {
+        if (!cfg || cfg.enabled !== true) return "已关闭：直接报错";
+        return "每轮最多 " + (Number(cfg.maxNotices) || 1) + " 条，之后仍失败就直接报错";
+      }
 
       function apply(ctx) {
         try {
@@ -117,7 +123,7 @@ window.__ModuleLoader__.load({
       }
 
       function Section() {
-        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 180000 } });
+        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 180000 }, notMultimodal: { enabled: true, maxNotices: 1 } });
         var snap = snapPair[0]; var setSnap = snapPair[1];
         var draftPair = React.useState(null);
         var draft = draftPair[0]; var setDraft = draftPair[1];
@@ -127,6 +133,8 @@ window.__ModuleLoader__.load({
         var honorDraft = honorPair[0]; var setHonorDraft = honorPair[1];
         var firstPair = React.useState(null);
         var firstDraft = firstPair[0]; var setFirstDraft = firstPair[1];
+        var nmPair = React.useState(null);
+        var nmDraft = nmPair[0]; var setNmDraft = nmPair[1];
 
         function pull(keepNotice) {
           getJson().then(function (cfg) {
@@ -137,11 +145,12 @@ window.__ModuleLoader__.load({
                 notice: keepNotice ? prev.notice : "",
                 honorRetryAfterMaxMs: Number(cfg.honorRetryAfterMaxMs) || 0,
                 firstTokenTimeout: cfg.firstTokenTimeout || { enabled: true, timeoutMs: 180000 },
+                notMultimodal: cfg.notMultimodal || { enabled: true, maxNotices: 1 },
               };
             });
           }).catch(function (e) {
             setSnap(function (prev) {
-              return { loading: false, rules: prev.rules, activity: prev.activity, waiting: 0, source: prev.source, error: String((e && e.message) || e), notice: prev.notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout };
+              return { loading: false, rules: prev.rules, activity: prev.activity, waiting: 0, source: prev.source, error: String((e && e.message) || e), notice: prev.notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout, notMultimodal: prev.notMultimodal };
             });
           });
         }
@@ -158,7 +167,9 @@ window.__ModuleLoader__.load({
         var honorDirty = honorDraft !== null;
         var first = firstDraft !== null ? firstDraft : snap.firstTokenTimeout;
         var firstDirty = firstDraft !== null;
-        var dirtyTotal = dirty || honorDirty || firstDirty;
+        var nm = nmDraft !== null ? nmDraft : snap.notMultimodal;
+        var nmDirty = nmDraft !== null;
+        var dirtyTotal = dirty || honorDirty || firstDirty || nmDirty;
 
         function base() { return cloneRules(draft !== null ? draft : snap.rules); }
         function updateRow(i, field, value) {
@@ -173,17 +184,17 @@ window.__ModuleLoader__.load({
         }
         function addRow() { setDraft(function () { var b = base(); b.push({ code: "", delayMs: 60000, maxRetries: 10 }); return b; }); }
         function removeRow(i) { setDraft(function () { var b = base(); b.splice(i, 1); return b; }); }
-        function setNotice(notice) { setSnap(function (prev) { return { loading: false, rules: prev.rules, activity: prev.activity, waiting: prev.waiting, source: prev.source, error: "", notice: notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout }; }); }
+        function setNotice(notice) { setSnap(function (prev) { return { loading: false, rules: prev.rules, activity: prev.activity, waiting: prev.waiting, source: prev.source, error: "", notice: notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout, notMultimodal: prev.notMultimodal }; }); }
         function save() {
           var payload = rows
             .filter(function (r) { return String(r.code).trim() !== ""; })
             .map(function (r) { return { code: String(r.code).trim(), delayMs: r.delayMs, maxRetries: r.maxRetries }; });
-          postRules(payload, honorMs, first).then(function (res) {
-            if (res && res.ok) { setDraft(null); setHonorDraft(null); setFirstDraft(null); setNotice("已保存，立即生效并持久化"); pull(true); }
+          postRules(payload, honorMs, first, nm).then(function (res) {
+            if (res && res.ok) { setDraft(null); setHonorDraft(null); setFirstDraft(null); setNmDraft(null); setNotice("已保存，立即生效并持久化"); pull(true); }
             else { setNotice("保存失败：" + ((res && res.error) || "未知错误")); }
           }).catch(function (e) { setNotice("保存失败：" + String((e && e.message) || e)); });
         }
-        function discard() { setDraft(null); setHonorDraft(null); setFirstDraft(null); }
+        function discard() { setDraft(null); setHonorDraft(null); setFirstDraft(null); setNmDraft(null); }
 
         try {
           var e = React.createElement;
@@ -194,6 +205,7 @@ window.__ModuleLoader__.load({
             "当前生效：" + (snap.rules.length ? snap.rules.map(function (r) { return r.code + " → " + Math.round(r.delayMs / 1000) + "s ×" + r.maxRetries; }).join("；") : "无规则（全部交给内置策略）")
             + " ｜ Retry-After 上限 " + (snap.honorRetryAfterMaxMs === 0 ? "已忽略" : Math.round(snap.honorRetryAfterMaxMs / 1000) + "s")
             + " ｜ 首字超时 " + (first.enabled === false ? "已关闭" : Math.round(first.timeoutMs / 1000) + "s")
+            + " ｜ 多模态提示 " + (nm.enabled === false ? "已关闭" : nm.maxNotices + " 条/轮")
             + " ｜ 来源：" + (snap.source === "file" ? "本界面保存" : "cordis.patch.yml 默认值")
           )));
           if (snap.waiting > 0) children.push(e("div", { style: S.warn, key: "w" }, "当前有 " + snap.waiting + " 个请求正在休眠等待重试…"));
@@ -262,6 +274,32 @@ window.__ModuleLoader__.load({
               e("span", { style: S.settingsNote, key: "n" }, firstNote(first))),
             e("div", { style: S.settingsHelp, key: "h" },
               "从发出请求到模型的第一个字（正文、思考、工具调用任一）最多等多久。超过就中断这次请求并按失败上报（机器码 TIMEOUT），可以再加一条规则码 TIMEOUT 让它自动重试。思考型模型很慢时别设太小；填 0 秒不合法，用上面的开关关闭。范围 1–3600 秒。")));
+          children.push(e("div", { style: S.settings, key: "nm" },
+            e("div", { style: S.settingsTitle, key: "nmt" }, "模型不支持多模态时"),
+            e("div", { style: S.settingsRow, key: "nmr" },
+              e("label", { key: "nml", style: { display: "flex", alignItems: "center", gap: "6px", fontSize: "13px" } },
+                e("input", {
+                  type: "checkbox",
+                  checked: nm.enabled !== false,
+                  onChange: function (ev) {
+                    setNmDraft({ enabled: ev.target.checked, maxNotices: nm.maxNotices });
+                  },
+                }),
+                e("span", null, "自动往上下文注入提示")),
+              e("input", {
+                type: "number", min: "1", max: "10", step: "1",
+                style: Object.assign({}, S.input, { width: "70px", marginLeft: "10px" }),
+                value: nm.maxNotices,
+                disabled: nm.enabled === false,
+                onChange: function (ev) {
+                  var n = Math.min(10, Math.max(1, Math.round(parseFloat(ev.target.value) || 0)));
+                  setNmDraft({ enabled: nm.enabled !== false, maxNotices: n });
+                },
+              }),
+              e("span", { style: S.unit, key: "u" }, "条/轮"),
+              e("span", { style: S.settingsNote, key: "n" }, nmNote(nm))),
+            e("div", { style: S.settingsHelp, key: "h" },
+              "上游回 The request model is not multimodal 时不直接把错误抛给用户：先往会话里追加一条模型可见的提示（告诉模型图片读不了、改用文字或工具返回的描述继续），然后让路由把该模型标记为失败、换到组内支持多模态的模型重试。本插件不对同一模型重试——图片还在，重发必然同样失败。范围 1–10 条，取消勾选 = 关闭（恢复直接报错）。")));
           if (snap.notice !== "") children.push(e("div", { style: snap.notice.indexOf("失败") >= 0 ? S.err : S.ok, key: "n" }, snap.notice));
           if (snap.error !== "") children.push(e("div", { style: S.err, key: "e" }, "宿主接口异常：" + snap.error + "（若插件刚重启稍候自动恢复）"));
           children.push(e("div", { style: S.hint, key: "h" }, "规则码四种形态：① HTTP 状态码（429、500…：匹配 status、code 与 message 中独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER…）；③ 字段=值（如 code=insufficient_quota、type=rate_limit_exceeded：匹配 provider 返回 JSON 字段，含被压平进 message 的响应体）；④ msg~子串（如 msg~finish_reason: error：忽略大小写地子串匹配失败 message，用于 provider 用 finish_reason 终止请求时报的 Provider finish_reason: error，此时既无 status 也只有通用 code PI_AI_ERROR）。多条规则按顺序取第一条命中。次数上限 0~1000。保存持久化到 llm-error-retry.rules.json；删除该文件回落到 cordis.patch.yml 默认规则。"));          children.push(e("div", { style: Object.assign({}, S.title, { marginTop: "14px", fontSize: "13px" }), key: "eh" }, "最近活动"));

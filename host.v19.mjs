@@ -121,6 +121,25 @@ const MIN_FIRST_TOKEN_TIMEOUT_MS = 1_000
 const MAX_FIRST_TOKEN_TIMEOUT_MS = 3_600_000
 /** 算作「模型已经开口」的 chunk：文本、思考、工具调用增量都算输出。 */
 const FIRST_TOKEN_CHUNKS = new Set(['text-delta', 'reasoning-delta', 'tool-call-delta'])
+/**
+ * 「当前模型不支持多模态」失败的兜底：不把这次失败直接抛给用户，而是往会话上下文里
+ * 追加一条模型可见的自动提示，告诉模型图片用不了、改用文字继续，然后放行给下游
+ * （model-failover 会因此把该模型标记为失败并切换到组内支持多模态的模型重试）。
+ *   - 为什么不在本插件内直接重试同一模型：请求里的图片还在，换个口气重发必然同样失败，
+ *     只会白烧一步并再写一条提示，把上下文越堆越脏。
+ *   - maxNotices 限制每轮最多注入几条，防止模型被判定失败后仍被反复路由回来。
+ */
+const DEFAULT_NOT_MULTIMODAL = {
+  enabled: true,
+  maxNotices: 1,
+  text: '【自动提示】上一条请求没有送达：当前模型不支持多模态（图片）输入。请不要依赖图片，改用文字、坐标、文件内容或工具返回的文字描述继续当前任务；确实需要看图时，请切换到支持多模态的模型。',
+}
+/** 每轮最多注入几条提示的上限。 */
+const MAX_NOTICES_LIMIT = 10
+/** 上游「模型不支持多模态」的文案判定（各网关措辞略有差异，只认核心短语）。 */
+const NOT_MULTIMODAL_PATTERN = /not[\s_-]*multimodal/i
+/** 自动提示消息的来源标记（区分人工输入与插件注入）。 */
+const NOTICE_SOURCE = 'llm-error-retry-notice'
 /** 自动续写注入消息的来源标记（区分人工输入与插件注入）。 */
 const CONTINUATION_SOURCE = 'llm-error-retry-continuation'
 const DEFAULT_MAX_TOKENS = {
@@ -299,6 +318,41 @@ export function validateFirstTokenTimeout(input) {
   return { enabled, timeoutMs }
 }
 
+/**
+ * Validate the `notMultimodal` deployment setting.
+ * @param {unknown} input - raw value from the patch row or rules file.
+ * @returns {{ enabled: boolean, maxNotices: number, text: string }} a resolved setting.
+ * @throws {Error} when a supplied value is of the wrong type or out of range.
+ */
+export function validateNotMultimodal(input) {
+  if (input === undefined || input === null) return { ...DEFAULT_NOT_MULTIMODAL }
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('llm-error-retry: notMultimodal must be an object of { enabled, maxNotices, text }')
+  }
+  const enabled = input.enabled === undefined ? DEFAULT_NOT_MULTIMODAL.enabled : input.enabled
+  if (typeof enabled !== 'boolean') throw new Error('llm-error-retry: notMultimodal.enabled must be a boolean')
+  const maxNotices = input.maxNotices === undefined ? DEFAULT_NOT_MULTIMODAL.maxNotices : Number(input.maxNotices)
+  if (!Number.isInteger(maxNotices) || maxNotices < 1 || maxNotices > MAX_NOTICES_LIMIT) {
+    throw new Error(`llm-error-retry: notMultimodal.maxNotices must be an integer within 1..${MAX_NOTICES_LIMIT}`)
+  }
+  const text = input.text === undefined ? DEFAULT_NOT_MULTIMODAL.text : input.text
+  if (typeof text !== 'string' || text.trim().length === 0) {
+    throw new Error('llm-error-retry: notMultimodal.text must be a non-empty string')
+  }
+  return { enabled, maxNotices, text }
+}
+
+/**
+ * 判断一次失败是不是「当前模型不支持多模态」。
+ * @param {unknown} failure - the normalized LlmFailure carried by the event.
+ * @returns {boolean} true when the upstream rejected the request for lack of multimodal support.
+ */
+function isNotMultimodalFailure(failure) {
+  if (failure === null || typeof failure !== 'object') return false
+  const message = typeof failure.message === 'string' ? failure.message : ''
+  return NOT_MULTIMODAL_PATTERN.test(message)
+}
+
 function validateRules(input) {
   if (input !== undefined && !Array.isArray(input)) throw new Error('llm-error-retry: rules must be an array of { code, delayMs, maxRetries }')
   const out = []
@@ -464,6 +518,16 @@ function renderPage() {
     </div>
     <div class="settings-help">请求发出后，若这段时间内没有收到模型的任何输出（文本、思考、工具调用都算输出），就中断本次请求并上报错误码 <code>TIMEOUT</code>。规则表里若有 <code>TIMEOUT</code> 规则，会按该规则休眠后自动重试；没有则本轮直接以失败结束，聊天区显示超时。范围 1–3600 秒，取消勾选 = 关闭。</div>
   </div>
+  <div class="settings">
+    <div class="settings-title">模型不支持多模态时（图片传给纯文本模型）</div>
+    <div class="settings-row">
+      <label style="display:flex;align-items:center;gap:6px"><input id="nm-enabled" type="checkbox"> 自动往上下文注入提示</label>
+      <input id="nm-max" type="number" min="1" max="10" step="1">
+      <span class="unit">条/轮</span>
+      <span id="nm-note" class="settings-note"></span>
+    </div>
+    <div class="settings-help">上游回 <code>The request model is not multimodal</code> 时不直接把错误抛给用户：先往会话里追加一条模型可见的自动提示，告诉模型图片读不了、改用文字或工具返回的描述继续，然后让模型路由（model-failover）把该模型标记为失败、换到组内支持多模态的模型重试。本插件不会对同一模型重试——请求里的图片还在，重发必然同样失败。范围 1–10 条，取消勾选 = 关闭（恢复直接报错）。</div>
+  </div>
   <div class="hint">规则码四种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）；④ <b>msg~子串</b>（如 <code>msg~finish_reason: error</code>：忽略大小写地子串匹配失败 message，用于没有 status、只有一句文本的失败，例如 provider 用 finish_reason 终止请求时的 <code>Provider finish_reason: error</code>）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~1000（0 = 命中即上报）。服务端 Retry-After 更长时按提示推迟，但会被下方「服务端 Retry-After 采信上限」截断——上游的 <code>Retry-After: 3600</code> 不会让你等满一小时。休眠/重试过程显示在会话框重试卡片中。保存写入 ~/.dsh/llm-error-retry/rules.json 并立即生效；删除该文件回落到 cordis.patch.yml 默认规则。</div>
   <div class="sub" style="margin-top:18px"><b>最近活动</b></div>
   <ul id="events"><li>加载中…</li></ul>
@@ -474,6 +538,8 @@ function renderPage() {
   var honorMs = 60000;
   var ftEnabled = true;
   var ftMs = 180000;
+  var nmEnabled = true;
+  var nmMax = 1;
   function $(id) { return document.getElementById(id); }
   function setNotice(text, cls) { var n = $('notice'); n.textContent = text; n.className = 'notice' + (cls ? ' ' + cls : ''); }
   function markDirty() { dirty = true; }
@@ -498,6 +564,15 @@ function renderPage() {
     $('ft-enabled').checked = ftEnabled;
     $('ft-seconds').value = Math.round(ftMs / 1000);
     $('ft-note').textContent = ftNote(ftMs, ftEnabled);
+  }
+  function nmNote(enabled, max) {
+    if (!enabled) return '已关闭：直接报错，不注入提示';
+    return '每轮最多注入 ' + max + ' 条，之后仍失败就直接报错';
+  }
+  function renderNotMultimodal() {
+    $('nm-enabled').checked = nmEnabled;
+    $('nm-max').value = nmMax;
+    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
   }
   function renderRows() {
     var tb = $('rows'); tb.innerHTML = '';
@@ -528,7 +603,7 @@ function renderPage() {
   function renderEvents(list) {
     var ul = $('events'); ul.innerHTML = '';
     if (!list || list.length === 0) { var li0 = document.createElement('li'); li0.textContent = '暂无记录'; ul.appendChild(li0); return; }
-    var labels = { mounted: '挂载', sleeping: '休眠等待中', retrying: '已重新发起请求', cancelled: '休眠被取消', exhausted: '预算耗尽，错误上报', saved: '配置已保存', continuation: '已自动续写', 'continuation-exhausted': '续写次数用尽', 'continuation-stalled': '续写无进展已停止', restart: '已自动重开新轮', 'restart-exhausted': '重开新轮次数用尽', 'restart-stalled': '无实质推进未重开', 'first-token-timeout': '首字超时已中断' };
+    var labels = { mounted: '挂载', sleeping: '休眠等待中', retrying: '已重新发起请求', cancelled: '休眠被取消', exhausted: '预算耗尽，错误上报', saved: '配置已保存', continuation: '已自动续写', 'continuation-exhausted': '续写次数用尽', 'continuation-stalled': '续写无进展已停止', restart: '已自动重开新轮', 'restart-exhausted': '重开新轮次数用尽', 'restart-stalled': '无实质推进未重开', 'first-token-timeout': '首字超时已中断', 'not-multimodal': '不支持多模态，已注入提示', 'not-multimodal-skip': '不支持多模态，已达提示上限' };
     list.slice(0, 12).forEach(function (e) {
       var li = document.createElement('li');
       var t = new Date(e.at).toLocaleTimeString();
@@ -542,6 +617,8 @@ function renderPage() {
         body = '第 ' + (e.turn !== undefined ? e.turn : '?') + ' 轮 · max-tokens 收尾 · 第 ' + (e.attempts !== undefined ? e.attempts : '?') + ' 次' + (e.maxRestartTurns !== undefined ? '/' + e.maxRestartTurns : '')
       } else if (e.type === 'first-token-timeout') {
         body = (e.provider || '?') + '/' + (e.model || '?') + ' · ' + Math.round((e.timeoutMs || 0) / 1000) + 's 内无任何输出'
+      } else if (e.type === 'not-multimodal' || e.type === 'not-multimodal-skip') {
+        body = (e.provider || '?') + ' · 第 ' + (e.notices !== undefined ? e.notices : '?') + ' 条'
       } else {
         body = e.failure + ' · 规则「' + e.rule + '」 第 ' + (e.retry || e.attempts || '?') + '/' + (e.maxRetries != null ? e.maxRetries : '?') + ' 次 · 休眠 ' + Math.round((e.delayMs || 0) / 1000) + 's'
       }
@@ -555,6 +632,9 @@ function renderPage() {
       + ' ｜ 首字超时 ' + (state.firstTokenTimeout && state.firstTokenTimeout.enabled === false
           ? '已关闭'
           : Math.round(Number(state.firstTokenTimeout && state.firstTokenTimeout.timeoutMs) || 0) / 1000 + 's')
+      + ' ｜ 多模态提示 ' + (state.notMultimodal && state.notMultimodal.enabled === false
+          ? '已关闭'
+          : (Number(state.notMultimodal && state.notMultimodal.maxNotices) || 0) + ' 条/轮')
       + ' ｜ 来源：' + (state.source === 'file' ? '界面保存文件' : 'cordis.patch.yml 默认值')
       + (state.waiting > 0 ? ' ｜ 正在休眠等待: ' + state.waiting : '');
     if (state.waiting > 0) setNotice('有 ' + state.waiting + ' 个请求正在休眠等待重试…', 'warn');
@@ -574,6 +654,12 @@ function renderPage() {
         ftEnabled = ft.enabled !== false;
         ftMs = Number(ft.timeoutMs) || 180000;
         renderFirstToken();
+      }
+      if (!keepDraft || !dirty) {
+        var nm = state.notMultimodal || {};
+        nmEnabled = nm.enabled !== false;
+        nmMax = Number(nm.maxNotices) || 1;
+        renderNotMultimodal();
       }
       applyState(state);
     }).catch(function (e) { setNotice('读取失败：' + e, 'err'); });
@@ -595,6 +681,17 @@ function renderPage() {
     $('ft-note').textContent = ftNote(ftMs, ftEnabled);
     markDirty();
   };
+  $('nm-enabled').onchange = function () {
+    nmEnabled = $('nm-enabled').checked;
+    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
+    markDirty();
+  };
+  $('nm-max').oninput = function () {
+    var n = Math.min(10, Math.max(1, Math.round(parseFloat($('nm-max').value) || 0)));
+    nmMax = n;
+    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
+    markDirty();
+  };
   $('add').onclick = function () { rows.push({ code: '', delayMs: 60000, maxRetries: 10 }); markDirty(); renderRows(); };
   $('revert').onclick = function () { dirty = false; refresh(false); setNotice('已放弃本地修改', 'ok'); };
   $('save').onclick = function () {
@@ -602,6 +699,7 @@ function renderPage() {
       rules: rows.filter(function (r) { return String(r.code).trim() !== ''; }).map(function (r) { return { code: String(r.code).trim(), delayMs: r.delayMs, maxRetries: r.maxRetries }; }),
       honorRetryAfterMaxMs: honorMs,
       firstTokenTimeout: { enabled: ftEnabled, timeoutMs: ftMs },
+      notMultimodal: { enabled: nmEnabled, maxNotices: nmMax },
     };
     fetch('/llm-error-retry/api/config', { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
       .then(function (res) {
@@ -642,6 +740,7 @@ export function apply(ctx, config = {}) {
   const maxTokens = validateMaxTokens(config.maxTokens)
   const yamlHonorRetryAfter = validateHonorRetryAfter(config.honorRetryAfterMaxMs)
   const yamlFirstToken = validateFirstTokenTimeout(config.firstTokenTimeout)
+  const yamlNotMultimodal = validateNotMultimodal(config.notMultimodal)
 
   let rules = yamlRules
   let rulesSource = 'yaml-default'
@@ -649,6 +748,8 @@ export function apply(ctx, config = {}) {
   let honorRetryAfterMaxMs = yamlHonorRetryAfter
   /** 首字超时：界面保存值优先于补丁行，保存后即时生效。 */
   let firstTokenTimeout = yamlFirstToken
+  /** 不支持多模态时的自动提示：界面保存值优先于补丁行，保存后即时生效。 */
+  let notMultimodal = yamlNotMultimodal
 
   /** 活跃休眠的唤醒回调：finish(value) */
   const waiters = new Set()
@@ -659,7 +760,7 @@ export function apply(ctx, config = {}) {
 
   function loadRulesFile() {
     try {
-      if (!existsSync(rulesFile)) { rules = yamlRules; rulesSource = 'yaml-default'; honorRetryAfterMaxMs = yamlHonorRetryAfter; firstTokenTimeout = yamlFirstToken; return }
+      if (!existsSync(rulesFile)) { rules = yamlRules; rulesSource = 'yaml-default'; honorRetryAfterMaxMs = yamlHonorRetryAfter; firstTokenTimeout = yamlFirstToken; notMultimodal = yamlNotMultimodal; return }
       const parsed = JSON.parse(readFileSync(rulesFile, 'utf8'))
       rules = validateRules(parsed.rules)
       // 设置单独校验：坏值只忽略它自己，不连累规则整体回落到 yaml 默认。
@@ -669,11 +770,15 @@ export function apply(ctx, config = {}) {
       if (parsed.firstTokenTimeout !== undefined) {
         try { firstTokenTimeout = validateFirstTokenTimeout(parsed.firstTokenTimeout) } catch {}
       }
+      if (parsed.notMultimodal !== undefined) {
+        try { notMultimodal = validateNotMultimodal(parsed.notMultimodal) } catch {}
+      }
       rulesSource = 'file'
     } catch (error) {
       rules = yamlRules
       honorRetryAfterMaxMs = yamlHonorRetryAfter
       firstTokenTimeout = yamlFirstToken
+      notMultimodal = yamlNotMultimodal
       rulesSource = 'yaml-default（覆盖文件被忽略：' + String((error && error.message) || error) + '）'
     }
   }
@@ -689,10 +794,11 @@ export function apply(ctx, config = {}) {
         status: 'mounted',
         mountedAt: new Date().toISOString(),
         pid: process.pid,
-        version: '0.16.0',
+        version: '0.17.0',
         rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
         rulesSource,
         firstTokenTimeout,
+        notMultimodal,
         ui: UI_PATH,
         waiting: waiters.size,
         lastEvents: recent,
@@ -722,10 +828,47 @@ export function apply(ctx, config = {}) {
     waiters.add(finish)
   })
 
+  // 「当前模型不支持多模态」：不把这次失败直接抛给用户，而是往会话上下文里追加一条
+  // 模型可见的自动提示（告诉模型图片读不了、改用文字继续），再放行给下游——model-failover
+  // 会因此把该模型标记为失败并切换到组内支持多模态的模型重试。
+  // 不在本插件内重试同一模型：请求里的图片还在，重发必然同样失败。
+  /** agentId -> { turn, count }：按轮计数，换轮自动归零。 */
+  const notMultimodalNotices = new Map()
+
+  const noteNotMultimodal = (agent, turn, provider, failure) => {
+    if (!notMultimodal.enabled) return false
+    if (!isNotMultimodalFailure(failure)) return false
+    const agentId = String(agent.id)
+    const state = notMultimodalNotices.get(agentId)
+    const count = state !== undefined && state.turn === turn ? state.count : 0
+    if (count >= notMultimodal.maxNotices) {
+      record({ type: 'not-multimodal-skip', agent: shortId(agentId), provider, notices: count })
+      ctx.logger.info(`llm-error-retry: 本轮已注入 ${count} 条「不支持多模态」提示（上限 ${notMultimodal.maxNotices}），不再重复注入`)
+      return false
+    }
+    try {
+      agent.session.append('user/message', {
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: notMultimodal.text }],
+        source: { kind: NOTICE_SOURCE },
+      }, { surfaceOp: 'append' })
+    } catch (error) {
+      ctx.logger.warn(`llm-error-retry: 注入「不支持多模态」提示失败：${String((error && error.message) || error)}`)
+      return false
+    }
+    notMultimodalNotices.set(agentId, { turn, count: count + 1 })
+    record({ type: 'not-multimodal', agent: shortId(agentId), provider, notices: count + 1 })
+    ctx.logger.info(`llm-error-retry: 上游判定当前模型不支持多模态，已注入自动提示并交给下游换模型（第 ${count + 1}/${notMultimodal.maxNotices} 条）`)
+    return true
+  }
+
   // prepend：置于水流最外层，命中规则的失败先由本插件处理（否决内置快速重试）。
   const disposeListener = ctx.on('agent/request-error', (payload, next) => {
     if (disposed) return next()
     const { agent, turn, step, provider, failure, signal } = payload
+    // 多模态不支持不是「等一等就好」的失败：先注入提示，再原样放行给下游路由换模型。
+    if (noteNotMultimodal(agent, turn, provider, failure)) return next()
     const rule = matchAgainst(rules, failure)
     if (rule === undefined) return next()
 
@@ -818,6 +961,7 @@ export function apply(ctx, config = {}) {
   const disposeCleanup = ctx.on('agent/disposed', ({ agent }) => {
     continuations.delete(String(agent.id))
     restarts.delete(String(agent.id))
+    notMultimodalNotices.delete(String(agent.id))
   })
 
   // 记录每个 agent 最近一步的 finish 与累计文本长度。
@@ -1116,6 +1260,7 @@ export function apply(ctx, config = {}) {
           rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
           honorRetryAfterMaxMs,
           firstTokenTimeout,
+          notMultimodal,
           source: rulesSource,
           waiting: waiters.size,
           lastEvents: recent.slice(0, 12),
@@ -1132,16 +1277,21 @@ export function apply(ctx, config = {}) {
         const nextFirstToken = body.firstTokenTimeout === undefined
           ? firstTokenTimeout
           : validateFirstTokenTimeout(body.firstTokenTimeout)
+        const nextNotMultimodal = body.notMultimodal === undefined
+          ? notMultimodal
+          : validateNotMultimodal(body.notMultimodal)
         writeFileSync(rulesFile, JSON.stringify({
           rules: next.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
           honorRetryAfterMaxMs: nextHonor,
           firstTokenTimeout: nextFirstToken,
+          notMultimodal: nextNotMultimodal,
         }, null, 2))
         rules = next
         honorRetryAfterMaxMs = nextHonor
         firstTokenTimeout = nextFirstToken
+        notMultimodal = nextNotMultimodal
         rulesSource = 'file'
-        record({ type: 'saved', source: 'ui', rules: rules.map(({ code, delayMs, maxRetries }) => `${code}->${delayMs}ms x${maxRetries}`), honorRetryAfterMaxMs, firstTokenTimeout: nextFirstToken })
+        record({ type: 'saved', source: 'ui', rules: rules.map(({ code, delayMs, maxRetries }) => `${code}->${delayMs}ms x${maxRetries}`), honorRetryAfterMaxMs, firstTokenTimeout: nextFirstToken, notMultimodal: nextNotMultimodal })
         ctx.logger.info(`llm-error-retry: rules saved via UI -> ${rules.map(({ code, delayMs, maxRetries }) => `${code}->${Math.round(delayMs / 1000)}s x${maxRetries}`).join(', ') || '(none, pass-through)'}; Retry-After 采信上限 ${Math.round(nextHonor / 1000)}s${nextHonor === 0 ? '（忽略服务端提示）' : ''}`)
         sendJson(res, 200, { ok: true })
       } catch (error) {

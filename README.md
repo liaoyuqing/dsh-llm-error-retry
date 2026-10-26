@@ -36,12 +36,12 @@ dsh plugin --profile web remove dsh-llm-error-retry # 卸载
 
 ### 手动安装（不经过 pnpm 的兜底方式）
 
-把仓库文件（`host.v15.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
+把仓库文件（`host.v19.mjs`、`client.js`、`package.json`）放到任意目录（如 `~/.dsh/plugins/llm-error-retry-ui/`），再在 `~/.dsh/cordis.patch.yml` 追加：
 
 ```yaml
 - insert:
     - id: llm-error-retry
-      name: ./plugins/llm-error-retry-ui/host.v15.mjs
+      name: ./plugins/llm-error-retry-ui/host.v19.mjs
       config:
         rules:
           - code: '429'
@@ -109,17 +109,38 @@ firstTokenTimeout:
   timeoutMs: 180000   # 1000–3600000；长思考模型别设太小，否则正常请求也会被判超时
 ```
 
+## 模型不支持多模态
+
+带图片的请求打到纯文本模型时，上游回 `The request model is not multimodal`（`code: PI_AI_ERROR`、没有 HTTP status、`usage` 全 0——在推理前就被拒）。默认行为不是把这次失败直接抛给用户，而是：
+
+1. 先往会话里追加一条**模型可见**的提示（`role: user`、来源标记 `llm-error-retry-notice`），告诉模型图片读不了、改用文字、坐标或工具返回的描述继续；
+2. 然后照常把失败放行给下游——模型路由（如 model-failover-manager）会因此把该模型标记为失败，切换到组内支持多模态的模型重试。
+
+**为什么不自己重试同一个模型**：请求里的图片还在，重发必然同样失败，只会白烧一步并再写一条提示，把上下文越堆越脏。本插件只负责「注入提示 + 放行」，换模型归路由。
+
+每轮注入条数由 `maxNotices` 封顶（默认 1，范围 1–10）；达到上限后再遇到同样的失败就记一条 `not-multimodal-skip` 并恢复正常报错，避免模型被反复路由回来时无限刷提示。命中判定是 `not[\s_-]*multimodal` 正则，兼容 `NOT MULTIMODAL` / `not-multimodal` / `not_multimodal` 等变体。
+
+对应配置（补丁行 `config.notMultimodal`，或设置分区里的「模型不支持多模态时」开关 + 条数）：
+
+```yaml
+notMultimodal:
+  enabled: true
+  maxNotices: 1    # 每轮最多注入几条（1–10）
+  # text 可省略，默认文案见 host 文件 DEFAULT_NOT_MULTIMODAL
+```
+
 ## 配置来源（优先级从高到低）
 
-1. **GUI 界面保存**：`~/.dsh/llm-error-retry/rules.json`（含设置分区与备用页，两处等价；跨重启持久，`npm` 升级不影响）。文件里除 `rules` 外还存 `honorRetryAfterMaxMs`（Retry-After 采信上限）与 `firstTokenTimeout`（首字超时）。
-2. `~/.dsh/cordis.patch.yml` 中同 id（`llm-error-retry`）覆盖行的 `config.rules`、`config.honorRetryAfterMaxMs` 与 `config.firstTokenTimeout`。
+
+1. **GUI 界面保存**：`~/.dsh/llm-error-retry/rules.json`（含设置分区与备用页，两处等价；跨重启持久，`npm` 升级不影响）。文件里除 `rules` 外还存 `honorRetryAfterMaxMs`（Retry-After 采信上限）、`firstTokenTimeout`（首字超时）与 `notMultimodal`（多模态提示）。
+2. `~/.dsh/cordis.patch.yml` 中同 id（`llm-error-retry`）覆盖行的 `config.rules`、`config.honorRetryAfterMaxMs`、`config.firstTokenTimeout` 与 `config.notMultimodal`。
 3. 本包内置默认（`cordis.patch.yml`）：`429 → 60s × 10`。
 
 运行快照与事件流水：`~/.dsh/llm-error-retry/status.json`（`config.dataDir` 可改数据目录）。
 
 ## 工作原理
 
-- **宿主半**（`host.v18.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链，且链号与 retryId 一律从会话日志续，不存进程内存），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子；首字超时走 `llm/stream` waterfall（包一层异步生成器，到点产出合成的 TIMEOUT finish chunk）。
+- **宿主半**（`host.v19.mjs`）：DSH 每次模型请求失败会派发 `agent/request-error` waterfall（payload 携带 `failure{message,code,status?,providerRetryAfterMs?}`、`retryPolicy`、`signal`）。插件命中规则后等待 `delayMs`，返回 `{kind:'retry'}` 让 agent 循环重新发起同一请求；并写入 `llm/retry` / `llm/retry-started` 会话持久事件（与内置重试同一契约、同一 retryId 贯穿整条链，且链号与 retryId 一律从会话日志续，不存进程内存），聊天区原生卡片即时渲染。输出截断的自动续写走 `agent/assistant-stream`（记录每步 finish）+ `agent/turn-stopping`（在轮次收尾处补投一步）+ `session/event`（轮次收尾后跨轮重开）三个钩子；首字超时走 `llm/stream` waterfall（包一层异步生成器，到点产出合成的 TIMEOUT finish chunk）；「不支持多模态」在同一个 `agent/request-error` 钩子上抢先处理（注入提示后 next() 放行）。
 - **浏览器半**（`client.js`）：DSH 的双拼包机制——`package.json` 声明 `dsh.client.platform=web` + `exports["./client"]`，宿主 client-modules 扫描到后把 bundle 并入 GUI 启动图（`window.__ModuleLoader__.load` 注册协议，与官方打包产物一致），在浏览器端注册 `settings.section` 设置分区。数据面走宿主 `webServer` 路由 `/llm-error-retry/api/config`（同源 fetch）。
 
 ## 二次开发注意（DSH 平台怪癖清单）

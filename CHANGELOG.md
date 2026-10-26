@@ -2,6 +2,16 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半模块文件名带 `vN` 是 DSH config-only HMR 的缓存失效手段（同路径模块不会被重新 import），与产品版本号的对应关系见下。
 
+## 0.17.0 — 2026-10-26
+
+- **新增：模型不支持多模态时不再直接报错**（`notMultimodal`）。上游对带图片的请求回 `The request model is not multimodal`（`code: PI_AI_ERROR`、无 HTTP status、`usage` 全 0，说明在推理前就被拒），此前整轮直接以 `error` 结束，用户看到报错、任务中断。
+  - 现在在 `agent/request-error` 里先往会话追加一条**模型可见**的提示（`role: user`、`source.kind = llm-error-retry-notice`），告诉模型图片读不了、改用文字/坐标/工具返回的描述继续；随后照常 `next()` 放行给下游，由模型路由（model-failover）把该模型标记为失败并换到组内支持多模态的模型重试。
+  - **不在本插件内重试同一模型**：请求里的图片还在，换口气重发必然同样失败，只会白烧一步并再写一条提示，把上下文越堆越脏。
+  - 每轮注入条数由 `maxNotices` 封顶（默认 1，范围 1–10），达上限记 `not-multimodal-skip` 后恢复正常报错——防止模型被反复路由回来时无限刷提示。
+  - 命中用 `not[\s_-]*multimodal` 正则，兼容 `NOT MULTIMODAL` / `not-multimodal` / `not_multimodal` 等措辞变体。
+  - 设置分区与备用页各有一个「模型不支持多模态时」开关 + 条数输入框。
+- 宿主半：`host.v19.mjs`。
+
 ## 0.16.0 — 2026-10-21
 
 - **修复：重试链序号记在内存里，会把会话写坏到打不开**。v15 用进程内 `counters`（`agent.id -> {epoch, used, retryId}`）记每条 `(turn, step, provider, policyKey)` 链重试到第几次；以下任一情况都会让它归零：`agent/disposed` 删条目、进程重建、`epoch`（provider/turn/step）变化、设置页保存规则后的 `counters.clear()`。归零后同一条链会接着写出 `retry: 1` + **新** retryId，而宿主读侧（`session-format-v3-to-v4` 的 `relationships`）要求同一策略链 `retry` 严格 +1、`retryId` 恒定，于是**整个会话打不开**，报 `llm/retry skips its policy attempt sequence`（2026-10-21 实测两个会话因此损坏，只能逐事件修日志才恢复）。
