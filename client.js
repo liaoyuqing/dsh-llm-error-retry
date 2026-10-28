@@ -23,6 +23,8 @@ window.__ModuleLoader__.load({
         "restart-exhausted": "重开新轮次数用尽，等人工",
         "restart-stalled": "本轮无实质推进，未重开新轮",
         "first-token-timeout": "首字超时，已中断",
+        "not-multimodal": "不支持多模态，已省略图片并重发",
+        "not-multimodal-skip": "不支持多模态，已达提示上限",
       };
       var S = {
         root: { fontSize: "13px", lineHeight: 1.6, padding: "16px 20px 24px", maxWidth: "760px", color: "var(--dsw-alias-label-primary, inherit)" },
@@ -106,7 +108,8 @@ window.__ModuleLoader__.load({
       /** 多模态提示的即时说明。 */
       function nmNote(cfg) {
         if (!cfg || cfg.enabled !== true) return "已关闭：直接报错";
-        return "每轮最多 " + (Number(cfg.maxNotices) || 1) + " 条，之后仍失败就直接报错";
+        var route = cfg.offloadImages === false ? "重发仍会失败，交给路由换模型" : "同一步重发继续回答";
+        return "每轮最多 " + (Number(cfg.maxNotices) || 1) + " 条（" + route + "）";
       }
 
       function apply(ctx) {
@@ -123,7 +126,7 @@ window.__ModuleLoader__.load({
       }
 
       function Section() {
-        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 180000 }, notMultimodal: { enabled: true, maxNotices: 1 } });
+        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 180000 }, notMultimodal: { enabled: true, offloadImages: true, maxNotices: 1 } });
         var snap = snapPair[0]; var setSnap = snapPair[1];
         var draftPair = React.useState(null);
         var draft = draftPair[0]; var setDraft = draftPair[1];
@@ -145,7 +148,7 @@ window.__ModuleLoader__.load({
                 notice: keepNotice ? prev.notice : "",
                 honorRetryAfterMaxMs: Number(cfg.honorRetryAfterMaxMs) || 0,
                 firstTokenTimeout: cfg.firstTokenTimeout || { enabled: true, timeoutMs: 180000 },
-                notMultimodal: cfg.notMultimodal || { enabled: true, maxNotices: 1 },
+                notMultimodal: cfg.notMultimodal || { enabled: true, offloadImages: true, maxNotices: 1 },
               };
             });
           }).catch(function (e) {
@@ -205,7 +208,7 @@ window.__ModuleLoader__.load({
             "当前生效：" + (snap.rules.length ? snap.rules.map(function (r) { return r.code + " → " + Math.round(r.delayMs / 1000) + "s ×" + r.maxRetries; }).join("；") : "无规则（全部交给内置策略）")
             + " ｜ Retry-After 上限 " + (snap.honorRetryAfterMaxMs === 0 ? "已忽略" : Math.round(snap.honorRetryAfterMaxMs / 1000) + "s")
             + " ｜ 首字超时 " + (first.enabled === false ? "已关闭" : Math.round(first.timeoutMs / 1000) + "s")
-            + " ｜ 多模态提示 " + (nm.enabled === false ? "已关闭" : nm.maxNotices + " 条/轮")
+            + " ｜ 多模态 " + (nm.enabled === false ? "已关闭" : (nm.offloadImages === false ? "仅提示 " : "省略图片+提示 ") + nm.maxNotices + " 条/轮")
             + " ｜ 来源：" + (snap.source === "file" ? "本界面保存" : "cordis.patch.yml 默认值")
           )));
           if (snap.waiting > 0) children.push(e("div", { style: S.warn, key: "w" }, "当前有 " + snap.waiting + " 个请求正在休眠等待重试…"));
@@ -282,10 +285,10 @@ window.__ModuleLoader__.load({
                   type: "checkbox",
                   checked: nm.enabled !== false,
                   onChange: function (ev) {
-                    setNmDraft({ enabled: ev.target.checked, maxNotices: nm.maxNotices });
+                    setNmDraft({ enabled: ev.target.checked, offloadImages: nm.offloadImages !== false, maxNotices: nm.maxNotices });
                   },
                 }),
-                e("span", null, "自动往上下文注入提示")),
+                e("span", null, "自动处置（注入提示）")),
               e("input", {
                 type: "number", min: "1", max: "10", step: "1",
                 style: Object.assign({}, S.input, { width: "70px", marginLeft: "10px" }),
@@ -293,13 +296,24 @@ window.__ModuleLoader__.load({
                 disabled: nm.enabled === false,
                 onChange: function (ev) {
                   var n = Math.min(10, Math.max(1, Math.round(parseFloat(ev.target.value) || 0)));
-                  setNmDraft({ enabled: nm.enabled !== false, maxNotices: n });
+                  setNmDraft({ enabled: nm.enabled !== false, offloadImages: nm.offloadImages !== false, maxNotices: n });
                 },
               }),
               e("span", { style: S.unit, key: "u" }, "条/轮"),
               e("span", { style: S.settingsNote, key: "n" }, nmNote(nm))),
+            e("div", { style: S.settingsRow, key: "nmo" },
+              e("label", { key: "nmol", style: { display: "flex", alignItems: "center", gap: "6px", fontSize: "13px", opacity: nm.enabled === false ? 0.5 : 1 } },
+                e("input", {
+                  type: "checkbox",
+                  checked: nm.offloadImages !== false,
+                  disabled: nm.enabled === false,
+                  onChange: function (ev) {
+                    setNmDraft({ enabled: nm.enabled !== false, offloadImages: ev.target.checked, maxNotices: nm.maxNotices });
+                  },
+                }),
+                e("span", null, "先把图片替换为占位说明"))),
             e("div", { style: S.settingsHelp, key: "h" },
-              "上游回 The request model is not multimodal 时不直接把错误抛给用户：先往会话里追加一条模型可见的提示（告诉模型图片读不了、改用文字或工具返回的描述继续），然后让路由把该模型标记为失败、换到组内支持多模态的模型重试。本插件不对同一模型重试——图片还在，重发必然同样失败。范围 1–10 条，取消勾选 = 关闭（恢复直接报错）。")));
+              "上游回 The request model is not multimodal 时不把这次失败抛给用户，本轮也不以失败收尾：先落一条持久的 image/offload 决定，把请求里未省略的图片换成占位说明（含图片只读路径），装配出的下一个请求就能被纯文本模型接受；再往会话里追加一条模型可见的提示，然后同一步重发——模型改用文字继续回答，聊天区不出现失败行。省略只作用于模型可见的请求，你贴的原图仍在对话里。取消「先把图片替换为占位说明」则退回只注入提示，交给模型路由把该模型标记为失败并换到组内支持多模态的模型。范围 1–10 条，取消「自动处置」= 关闭（恢复直接报错）。")));
           if (snap.notice !== "") children.push(e("div", { style: snap.notice.indexOf("失败") >= 0 ? S.err : S.ok, key: "n" }, snap.notice));
           if (snap.error !== "") children.push(e("div", { style: S.err, key: "e" }, "宿主接口异常：" + snap.error + "（若插件刚重启稍候自动恢复）"));
           children.push(e("div", { style: S.hint, key: "h" }, "规则码四种形态：① HTTP 状态码（429、500…：匹配 status、code 与 message 中独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER…）；③ 字段=值（如 code=insufficient_quota、type=rate_limit_exceeded：匹配 provider 返回 JSON 字段，含被压平进 message 的响应体）；④ msg~子串（如 msg~finish_reason: error：忽略大小写地子串匹配失败 message，用于 provider 用 finish_reason 终止请求时报的 Provider finish_reason: error，此时既无 status 也只有通用 code PI_AI_ERROR）。多条规则按顺序取第一条命中。次数上限 0~1000。保存持久化到 llm-error-retry.rules.json；删除该文件回落到 cordis.patch.yml 默认规则。"));          children.push(e("div", { style: Object.assign({}, S.title, { marginTop: "14px", fontSize: "13px" }), key: "eh" }, "最近活动"));
@@ -325,6 +339,11 @@ window.__ModuleLoader__.load({
                   + (a.maxRestartTurns !== undefined ? "/" + a.maxRestartTurns : "")
                   + (a.reason ? " · " + a.reason : "");
               } else if (a.type === "first-token-timeout") {
+              } else if (a.type === "not-multimodal") {
+                detail = (a.provider ? a.provider + " · " : "") + "第 " + (a.notices !== undefined ? a.notices : "?") + " 次提示"
+                  + (a.offloaded ? " · 省略图片 " + a.offloaded + " 条消息" : " · 没有可省略的图片，已交给路由换模型");
+              } else if (a.type === "not-multimodal-skip") {
+                detail = (a.provider ? a.provider + " · " : "") + "本轮已提示 " + (a.notices !== undefined ? a.notices : "?") + " 次，达上限后恢复直接报错";
                 detail = (a.provider ? a.provider + " · " : "") + (a.model ? a.model + " · " : "")
                   + "等了 " + Math.round((Number(a.timeoutMs) || 0) / 1000) + "s 没有第一个字";
               } else {

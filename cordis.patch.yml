@@ -10,6 +10,8 @@
         # 模型不支持多模态时：自动往上下文注入提示，而不是直接报错。
         notMultimodal:
           enabled: true
+          # 先把请求里未省略的图片标记为已省略（占位文字代替图片字节），使同一步重发能成功。
+          offloadImages: true
           maxNotices: 1    # 每轮最多注入几条（1–10）；text 省略则用内置文案
         # 服务端 Retry-After 提示最多被采信多久（毫秒）。0 = 完全忽略提示、只按规则节奏。
         honorRetryAfterMaxMs: 60000

@@ -87,7 +87,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 export const name = 'llm-error-retry'
-export const inject = ['timer', 'agents']
+export const inject = ['timer', 'agents', 'sessions']
 
 const DEFAULT_RULES = [{ code: '429', delayMs: 60_000, maxRetries: 10 }]
 const MIN_DELAY_MS = 100
@@ -113,17 +113,24 @@ const MAX_FIRST_TOKEN_TIMEOUT_MS = 3_600_000
 /** 算作「模型已经开口」的 chunk：文本、思考、工具调用增量都算输出。 */
 const FIRST_TOKEN_CHUNKS = new Set(['text-delta', 'reasoning-delta', 'tool-call-delta'])
 /**
- * 「当前模型不支持多模态」失败的兜底：不把这次失败直接抛给用户，而是往会话上下文里
- * 追加一条模型可见的自动提示，告诉模型图片用不了、改用文字继续，然后放行给下游
- * （model-failover 会因此把该模型标记为失败并切换到组内支持多模态的模型重试）。
- *   - 为什么不在本插件内直接重试同一模型：请求里的图片还在，换个口气重发必然同样失败，
- *     只会白烧一步并再写一条提示，把上下文越堆越脏。
+ * 「当前模型不支持多模态」失败的兜底：不把这次失败直接抛给用户。
+ * 处置两步，都在本轮内完成，轮次继续跑而不是以 error 收尾：
+ *   1. 把当前请求里还没省略的图片标记为 `offloaded`（与宿主 compaction-image-offload
+ *      共用同一份持久决定 `image/offload`），请求装配随即把它们投影成一段说明文字
+ *      （含只读路径），重发时请求里不再有图片字节；
+ *   2. 追加一条模型可见的自动提示，告诉模型图片用不了、改用文字或工具返回的描述继续。
+ * 两步都成功就地返回 retry（同一步重发）：模型看到的是「没有图片 + 一句说明」的请求。
+ *   - 为什么要先省略图片再重试：图片字节还在时换个口气重发必然同样失败，白烧一步。
+ *   - 省略只影响模型可见的请求；人类对话里用户贴的原图仍在（surface 替换是模型侧的）。
+ *   - 找不到可省略的图片（例如图片来自请求外部）时退回旧行为：只注入提示并放行给下游，
+ *     model-failover 会把该模型标记为失败、换成组内支持多模态的模型。
  *   - maxNotices 限制每轮最多注入几条，防止模型被判定失败后仍被反复路由回来。
  */
 const DEFAULT_NOT_MULTIMODAL = {
   enabled: true,
+  offloadImages: true,
   maxNotices: 1,
-  text: '【自动提示】上一条请求没有送达：当前模型不支持多模态（图片）输入。请不要依赖图片，改用文字、坐标、文件内容或工具返回的文字描述继续当前任务；确实需要看图时，请切换到支持多模态的模型。',
+  text: '【自动提示】上一条请求没有送达：当前模型不支持多模态（图片）输入，请求里的图片已替换为占位说明。请不要依赖图片，改用文字、坐标、文件内容或工具返回的文字描述继续当前任务；确实需要看图时，请切换到支持多模态的模型。',
 }
 /** 每轮最多注入几条提示的上限。 */
 const MAX_NOTICES_LIMIT = 10
@@ -312,16 +319,18 @@ export function validateFirstTokenTimeout(input) {
 /**
  * Validate the `notMultimodal` deployment setting.
  * @param {unknown} input - raw value from the patch row or rules file.
- * @returns {{ enabled: boolean, maxNotices: number, text: string }} a resolved setting.
+ * @returns {{ enabled: boolean, offloadImages: boolean, maxNotices: number, text: string }} a resolved setting.
  * @throws {Error} when a supplied value is of the wrong type or out of range.
  */
 export function validateNotMultimodal(input) {
   if (input === undefined || input === null) return { ...DEFAULT_NOT_MULTIMODAL }
   if (typeof input !== 'object' || Array.isArray(input)) {
-    throw new Error('llm-error-retry: notMultimodal must be an object of { enabled, maxNotices, text }')
+    throw new Error('llm-error-retry: notMultimodal must be an object of { enabled, offloadImages, maxNotices, text }')
   }
   const enabled = input.enabled === undefined ? DEFAULT_NOT_MULTIMODAL.enabled : input.enabled
   if (typeof enabled !== 'boolean') throw new Error('llm-error-retry: notMultimodal.enabled must be a boolean')
+  const offloadImages = input.offloadImages === undefined ? DEFAULT_NOT_MULTIMODAL.offloadImages : input.offloadImages
+  if (typeof offloadImages !== 'boolean') throw new Error('llm-error-retry: notMultimodal.offloadImages must be a boolean')
   const maxNotices = input.maxNotices === undefined ? DEFAULT_NOT_MULTIMODAL.maxNotices : Number(input.maxNotices)
   if (!Number.isInteger(maxNotices) || maxNotices < 1 || maxNotices > MAX_NOTICES_LIMIT) {
     throw new Error(`llm-error-retry: notMultimodal.maxNotices must be an integer within 1..${MAX_NOTICES_LIMIT}`)
@@ -330,7 +339,7 @@ export function validateNotMultimodal(input) {
   if (typeof text !== 'string' || text.trim().length === 0) {
     throw new Error('llm-error-retry: notMultimodal.text must be a non-empty string')
   }
-  return { enabled, maxNotices, text }
+  return { enabled, offloadImages, maxNotices, text }
 }
 
 /**
@@ -513,11 +522,12 @@ function renderPage() {
     <div class="settings-title">模型不支持多模态时（图片传给纯文本模型）</div>
     <div class="settings-row">
       <label style="display:flex;align-items:center;gap:6px"><input id="nm-enabled" type="checkbox"> 自动往上下文注入提示</label>
+      <label style="display:flex;align-items:center;gap:6px"><input id="nm-offload" type="checkbox"> 先把图片替换为占位说明</label>
       <input id="nm-max" type="number" min="1" max="10" step="1">
       <span class="unit">条/轮</span>
       <span id="nm-note" class="settings-note"></span>
     </div>
-    <div class="settings-help">上游回 <code>The request model is not multimodal</code> 时不直接把错误抛给用户：先往会话里追加一条模型可见的自动提示，告诉模型图片读不了、改用文字或工具返回的描述继续，然后让模型路由（model-failover）把该模型标记为失败、换到组内支持多模态的模型重试。本插件不会对同一模型重试——请求里的图片还在，重发必然同样失败。范围 1–10 条，取消勾选 = 关闭（恢复直接报错）。</div>
+    <div class="settings-help">上游回 <code>The request model is not multimodal</code> 时不把错误抛给用户：先把本请求里还没省略的图片标记为「已省略」（与宿主 compaction-image-offload 共用同一份持久决定，之后装配的请求用占位文字代替图片字节，人类对话里的原图不受影响），再往会话里追加一条模型可见的自动提示，然后<b>同一步重发</b>——本轮继续跑、不以失败收尾，模型会照常给出文字回答或提示你换模型。找不到可省略的图片时退回旧行为：只注入提示并放行给模型路由（model-failover）换模型。范围 1–10 条，取消勾选 = 关闭（恢复直接报错）。</div>
   </div>
   <div class="hint">规则码四种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）；④ <b>msg~子串</b>（如 <code>msg~finish_reason: error</code>：忽略大小写地子串匹配失败 message，用于没有 status、只有一句文本的失败，例如 provider 用 finish_reason 终止请求时的 <code>Provider finish_reason: error</code>）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~1000（0 = 命中即上报）。服务端 Retry-After 更长时按提示推迟，但会被下方「服务端 Retry-After 采信上限」截断——上游的 <code>Retry-After: 3600</code> 不会让你等满一小时。休眠/重试过程显示在会话框重试卡片中。保存写入 ~/.dsh/llm-error-retry/rules.json 并立即生效；删除该文件回落到 cordis.patch.yml 默认规则。</div>
   <div class="sub" style="margin-top:18px"><b>最近活动</b></div>
@@ -530,6 +540,7 @@ function renderPage() {
   var ftEnabled = true;
   var ftMs = 180000;
   var nmEnabled = true;
+  var nmOffload = true;
   var nmMax = 1;
   function $(id) { return document.getElementById(id); }
   function setNotice(text, cls) { var n = $('notice'); n.textContent = text; n.className = 'notice' + (cls ? ' ' + cls : ''); }
@@ -556,14 +567,15 @@ function renderPage() {
     $('ft-seconds').value = Math.round(ftMs / 1000);
     $('ft-note').textContent = ftNote(ftMs, ftEnabled);
   }
-  function nmNote(enabled, max) {
+  function nmNote(enabled, offload, max) {
     if (!enabled) return '已关闭：直接报错，不注入提示';
-    return '每轮最多注入 ' + max + ' 条，之后仍失败就直接报错';
+    return (offload ? '先省略图片再同一步重发' : '只注入提示，交给路由换模型') + '；每轮最多 ' + max + ' 条';
   }
   function renderNotMultimodal() {
     $('nm-enabled').checked = nmEnabled;
+    $('nm-offload').checked = nmOffload;
     $('nm-max').value = nmMax;
-    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
+    $('nm-note').textContent = nmNote(nmEnabled, nmOffload, nmMax);
   }
   function renderRows() {
     var tb = $('rows'); tb.innerHTML = '';
@@ -594,7 +606,7 @@ function renderPage() {
   function renderEvents(list) {
     var ul = $('events'); ul.innerHTML = '';
     if (!list || list.length === 0) { var li0 = document.createElement('li'); li0.textContent = '暂无记录'; ul.appendChild(li0); return; }
-    var labels = { mounted: '挂载', sleeping: '休眠等待中', retrying: '已重新发起请求', cancelled: '休眠被取消', exhausted: '预算耗尽，错误上报', saved: '配置已保存', continuation: '已自动续写', 'continuation-exhausted': '续写次数用尽', 'continuation-stalled': '续写无进展已停止', restart: '已自动重开新轮', 'restart-exhausted': '重开新轮次数用尽', 'restart-stalled': '无实质推进未重开', 'first-token-timeout': '首字超时已中断', 'not-multimodal': '不支持多模态，已注入提示', 'not-multimodal-skip': '不支持多模态，已达提示上限' };
+    var labels = { mounted: '挂载', sleeping: '休眠等待中', retrying: '已重新发起请求', cancelled: '休眠被取消', exhausted: '预算耗尽，错误上报', saved: '配置已保存', continuation: '已自动续写', 'continuation-exhausted': '续写次数用尽', 'continuation-stalled': '续写无进展已停止', restart: '已自动重开新轮', 'restart-exhausted': '重开新轮次数用尽', 'restart-stalled': '无实质推进未重开', 'first-token-timeout': '首字超时已中断', 'not-multimodal': '不支持多模态，已省略图片并重发', 'not-multimodal-skip': '不支持多模态，已达提示上限' };
     list.slice(0, 12).forEach(function (e) {
       var li = document.createElement('li');
       var t = new Date(e.at).toLocaleTimeString();
@@ -610,6 +622,7 @@ function renderPage() {
         body = (e.provider || '?') + '/' + (e.model || '?') + ' · ' + Math.round((e.timeoutMs || 0) / 1000) + 's 内无任何输出'
       } else if (e.type === 'not-multimodal' || e.type === 'not-multimodal-skip') {
         body = (e.provider || '?') + ' · 第 ' + (e.notices !== undefined ? e.notices : '?') + ' 条'
+          + (e.offloaded !== undefined ? ' · 省略图片 ' + e.offloaded + ' 条消息' : '')
       } else {
         body = e.failure + ' · 规则「' + e.rule + '」 第 ' + (e.retry || e.attempts || '?') + '/' + (e.maxRetries != null ? e.maxRetries : '?') + ' 次 · 休眠 ' + Math.round((e.delayMs || 0) / 1000) + 's'
       }
@@ -623,9 +636,10 @@ function renderPage() {
       + ' ｜ 首字超时 ' + (state.firstTokenTimeout && state.firstTokenTimeout.enabled === false
           ? '已关闭'
           : Math.round(Number(state.firstTokenTimeout && state.firstTokenTimeout.timeoutMs) || 0) / 1000 + 's')
-      + ' ｜ 多模态提示 ' + (state.notMultimodal && state.notMultimodal.enabled === false
+      + ' ｜ 多模态 ' + (state.notMultimodal && state.notMultimodal.enabled === false
           ? '已关闭'
-          : (Number(state.notMultimodal && state.notMultimodal.maxNotices) || 0) + ' 条/轮')
+          : (state.notMultimodal && state.notMultimodal.offloadImages === false ? '仅提示' : '省略图片+提示')
+            + ' ' + (Number(state.notMultimodal && state.notMultimodal.maxNotices) || 0) + ' 条/轮')
       + ' ｜ 来源：' + (state.source === 'file' ? '界面保存文件' : 'cordis.patch.yml 默认值')
       + (state.waiting > 0 ? ' ｜ 正在休眠等待: ' + state.waiting : '');
     if (state.waiting > 0) setNotice('有 ' + state.waiting + ' 个请求正在休眠等待重试…', 'warn');
@@ -649,6 +663,7 @@ function renderPage() {
       if (!keepDraft || !dirty) {
         var nm = state.notMultimodal || {};
         nmEnabled = nm.enabled !== false;
+        nmOffload = nm.offloadImages !== false;
         nmMax = Number(nm.maxNotices) || 1;
         renderNotMultimodal();
       }
@@ -674,13 +689,18 @@ function renderPage() {
   };
   $('nm-enabled').onchange = function () {
     nmEnabled = $('nm-enabled').checked;
-    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
+    $('nm-note').textContent = nmNote(nmEnabled, nmOffload, nmMax);
+    markDirty();
+  };
+  $('nm-offload').onchange = function () {
+    nmOffload = $('nm-offload').checked;
+    $('nm-note').textContent = nmNote(nmEnabled, nmOffload, nmMax);
     markDirty();
   };
   $('nm-max').oninput = function () {
     var n = Math.min(10, Math.max(1, Math.round(parseFloat($('nm-max').value) || 0)));
     nmMax = n;
-    $('nm-note').textContent = nmNote(nmEnabled, nmMax);
+    $('nm-note').textContent = nmNote(nmEnabled, nmOffload, nmMax);
     markDirty();
   };
   $('add').onclick = function () { rows.push({ code: '', delayMs: 60000, maxRetries: 10 }); markDirty(); renderRows(); };
@@ -690,7 +710,7 @@ function renderPage() {
       rules: rows.filter(function (r) { return String(r.code).trim() !== ''; }).map(function (r) { return { code: String(r.code).trim(), delayMs: r.delayMs, maxRetries: r.maxRetries }; }),
       honorRetryAfterMaxMs: honorMs,
       firstTokenTimeout: { enabled: ftEnabled, timeoutMs: ftMs },
-      notMultimodal: { enabled: nmEnabled, maxNotices: nmMax },
+      notMultimodal: { enabled: nmEnabled, offloadImages: nmOffload, maxNotices: nmMax },
     };
     fetch('/llm-error-retry/api/config', { method: 'POST', cache: 'no-store', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
       .then(function (res) {
@@ -785,7 +805,7 @@ export function apply(ctx, config = {}) {
         status: 'mounted',
         mountedAt: new Date().toISOString(),
         pid: process.pid,
-        version: '0.18.0',
+        version: '0.19.0',
         rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
         rulesSource,
         firstTokenTimeout,
@@ -819,13 +839,63 @@ export function apply(ctx, config = {}) {
     waiters.add(finish)
   })
 
-  // 「当前模型不支持多模态」：不把这次失败直接抛给用户，而是往会话上下文里追加一条
-  // 模型可见的自动提示（告诉模型图片读不了、改用文字继续），再放行给下游——model-failover
-  // 会因此把该模型标记为失败并切换到组内支持多模态的模型重试。
-  // 不在本插件内重试同一模型：请求里的图片还在，重发必然同样失败。
+  // 「当前模型不支持多模态」：不把这次失败直接抛给用户。先把请求里的图片标记为已省略，
+  // 再往上下文追加一条模型可见的自动提示，然后同一步重发——本轮继续跑，不以 error 收尾。
   /** agentId -> { turn, count }：按轮计数，换轮自动归零。 */
   const notMultimodalNotices = new Map()
 
+  /**
+   * 把当前请求可见的图片全部标记为已省略，使之后装配的请求用占位文字代替图片字节。
+   * 与宿主的 compaction-image-offload 共用同一份持久决定（`image/offload` 事件 + 投影）；
+   * 该投影未安装时返回 0，把失败留给下游路由，而不是写下无人解释的事件。
+   * @param {any} agent - the agent whose session surface is inspected.
+   * @returns {number} number of message nodes whose images were newly omitted.
+   */
+  const offloadAllImages = (agent) => {
+    let registered = false
+    try {
+      registered = ctx.sessions.messageProjections.some((item) => item.type === 'image/offload')
+    } catch {
+      registered = false
+    }
+    if (!registered) return 0
+    const session = agent.session
+    const targets = []
+    for (const seq of session.surface.nodes) {
+      const event = session.eventAt(seq)
+      if (event === undefined) continue
+      if (event.type !== 'user/message' && event.type !== 'tool/result') continue
+      const message = session.deriveEventMessage(event)
+      if (message === null) continue
+      const imageIndexes = []
+      let imageIndex = 0
+      for (const block of message.content) {
+        if (block.type !== 'image') continue
+        if (block.offloaded !== true) imageIndexes.push(imageIndex)
+        imageIndex += 1
+      }
+      if (imageIndexes.length > 0) targets.push({ seq, imageIndexes })
+    }
+    if (targets.length === 0) return 0
+    try {
+      session.append('image/offload', { targets })
+    } catch (error) {
+      ctx.logger.warn(`llm-error-retry: 标记图片省略失败：${String((error && error.message) || error)}`)
+      return 0
+    }
+    return targets.length
+  }
+
+  /**
+   * 处置一次「当前模型不支持多模态」失败。
+   * @param {any} agent - the failing agent.
+   * @param {number} turn - the turn that failed.
+   * @param {string|undefined} provider - the provider that rejected the request.
+   * @param {unknown} failure - the normalized LlmFailure carried by the event.
+   * @returns {'retry'|'handed-over'|false} 'retry' when the same step should be re-issued,
+   *   'handed-over' when only the notice was injected and the downstream route must decide,
+   *   false when this failure is not handled here.
+   */
   const noteNotMultimodal = (agent, turn, provider, failure) => {
     if (!notMultimodal.enabled) return false
     if (!isNotMultimodalFailure(failure)) return false
@@ -836,6 +906,16 @@ export function apply(ctx, config = {}) {
       record({ type: 'not-multimodal-skip', agent: shortId(agentId), provider, notices: count })
       ctx.logger.info(`llm-error-retry: 本轮已注入 ${count} 条「不支持多模态」提示（上限 ${notMultimodal.maxNotices}），不再重复注入`)
       return false
+    }
+    let offloaded = 0
+    if (notMultimodal.offloadImages) {
+      // 省略图片是尽力而为：任何意外都不能让错误处理本身抛出去、把失败变成宿主级异常。
+      try {
+        offloaded = offloadAllImages(agent)
+      } catch (error) {
+        ctx.logger.warn(`llm-error-retry: 省略图片时出错，退回只注入提示：${String((error && error.message) || error)}`)
+        offloaded = 0
+      }
     }
     try {
       agent.session.append('user/message', {
@@ -849,17 +929,24 @@ export function apply(ctx, config = {}) {
       return false
     }
     notMultimodalNotices.set(agentId, { turn, count: count + 1 })
-    record({ type: 'not-multimodal', agent: shortId(agentId), provider, notices: count + 1 })
-    ctx.logger.info(`llm-error-retry: 上游判定当前模型不支持多模态，已注入自动提示并交给下游换模型（第 ${count + 1}/${notMultimodal.maxNotices} 条）`)
-    return true
+    record({ type: 'not-multimodal', agent: shortId(agentId), provider, notices: count + 1, offloaded })
+    if (offloaded > 0) {
+      ctx.logger.info(`llm-error-retry: 上游判定当前模型不支持多模态，已省略 ${offloaded} 条消息中的图片并注入提示，同一步重发（第 ${count + 1}/${notMultimodal.maxNotices} 条）`)
+      return 'retry'
+    }
+    ctx.logger.info(`llm-error-retry: 上游判定当前模型不支持多模态，无可省略图片，已注入提示并交给下游换模型（第 ${count + 1}/${notMultimodal.maxNotices} 条）`)
+    return 'handed-over'
   }
 
   // prepend：置于水流最外层，命中规则的失败先由本插件处理（否决内置快速重试）。
   const disposeListener = ctx.on('agent/request-error', (payload, next) => {
     if (disposed) return next()
     const { agent, turn, step, provider, failure, signal } = payload
-    // 多模态不支持不是「等一等就好」的失败：先注入提示，再原样放行给下游路由换模型。
-    if (noteNotMultimodal(agent, turn, provider, failure)) return next()
+    // 多模态不支持不是「等一等就好」的失败：省略图片 + 注入提示后同一步重发；
+    // 连图片都找不到时只留提示，放行给下游路由换模型。
+    const multimodal = noteNotMultimodal(agent, turn, provider, failure)
+    if (multimodal === 'retry') return Promise.resolve({ kind: 'retry' })
+    if (multimodal === 'handed-over') return next()
     const rule = matchAgainst(rules, failure)
     if (rule === undefined) return next()
 
@@ -875,7 +962,12 @@ export function apply(ctx, config = {}) {
     if (attempt > rule.maxRetries) {
       record({ type: 'exhausted', agent: shortId(agentId), provider, failure: label, rule: rule.code, attempts: rule.maxRetries })
       ctx.logger.info(`llm-error-retry: ${label} 已达规则 "${rule.code}" 的最大重试次数 (${rule.maxRetries})，错误将向上抛出`)
-      return Promise.resolve(undefined)
+      // 必须 next() 而不是直接返回 undefined：waterfall 的语义是「不调 next() 就是
+      // 短路整条链」。本插件 prepend 在最外层，而它的内层（model-failover 的失败
+      // 路由、宿主自己的兜底）全靠这条链往下走——直接返回 undefined 会让所有下游
+      // 监听器都没机会接手，这次失败就只会被原样抛回给用户：模型换了组也换不了。
+      // 「重试耗尽」这件事只该由本插件决定，不该顺带否决别人的处置。
+      return next()
     }
 
     let delayMs = rule.delayMs
@@ -928,7 +1020,8 @@ export function apply(ctx, config = {}) {
     return sleepCancellable(delayMs, signal).then((slept) => {
       if (!slept) {
         record({ type: 'cancelled', agent: entry.agent, provider, failure: label, rule: rule.code, retry: attempt, maxRetries: rule.maxRetries })
-        return undefined
+        // 取消也要 next()：不调就是短路整条链，下游（失败路由）就再也接不到这次失败。
+        return next()
       }
       // 读侧要求 llm/retry-started 必须配对先前的调度事件：调度没落盘就不要补 started。
       if (scheduled) {
