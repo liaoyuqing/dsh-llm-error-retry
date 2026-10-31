@@ -45,8 +45,8 @@ dsh plugin --profile web remove dsh-llm-error-retry # 卸载
       config:
         rules:
           - code: '429'
-            delayMs: 60000
-            maxRetries: 10
+            delayMs: 5000
+            maxRetries: 5
 ```
 
 web profile 默认 `patchReload: live`，保存即热挂载；刷新 GUI 页面加载设置分区（浏览器半由 DSH 的 client-modules 扫描 `package.json` 的 `dsh.client` 声明自动并入启动图，零构建）。
@@ -68,7 +68,7 @@ web profile 默认 `patchReload: live`，保存即热挂载；刷新 GUI 页面�
 
 - 监听 `agent/request-error` waterfall，`prepend: true` 置于**最外层**：命中即接管，优先于内置 llm-retry 的快速指数退避；预算耗尽直接上报（不再回退到内置策略）；未命中的失败原样放行。
 - 计数按「同一 Agent + 同一请求序列（provider/turn/step）」，新一轮请求自动重置；Agent 销毁即清理。
-- 服务端返回 `Retry-After` 且比配置更长时按 `Retry-After` 推迟，但**最多只多等 `honorRetryAfterMaxMs`**（默认 60s，在设置分区可改，0 = 完全忽略提示）。上游常回 `Retry-After: 3600`（一小时），无上限地照做会让会话整小时不动，还把你规则里写的休眠时长悄悄改掉。
+- 服务端返回 `Retry-After` 且比配置更长时按 `Retry-After` 推迟，但**最多只多等 `honorRetryAfterMaxMs`**（默认 10s，在设置分区可改，0 = 完全忽略提示）。上游常回 `Retry-After: 3600`（一小时），无上限地照做会让会话整小时不动，还把你规则里写的休眠时长悄悄改掉。
 - 休眠可被用户中断/停止即时唤醒，会话卡片显示为已取消。
 
 ## 输出截断自动续写
@@ -106,7 +106,7 @@ maxTokens:
 ```yaml
 firstTokenTimeout:
   enabled: true
-  timeoutMs: 180000   # 1000–3600000；长思考模型别设太小，否则正常请求也会被判超时
+  timeoutMs: 90000    # 1000–3600000；长思考模型别设太小，否则正常请求也会被判超时
 ```
 
 ## 模型不支持多模态
@@ -121,7 +121,7 @@ firstTokenTimeout:
 
 **为什么不只重试不省略**：图片字节还在时换个口气重发必然同样失败，只会白烧一步并再写一条提示，把上下文越堆越脏。
 
-每轮注入条数由 `maxNotices` 封顶（默认 1，范围 1–10）；达到上限后再遇到同样的失败就记一条 `not-multimodal-skip` 并恢复正常报错，避免模型被反复路由回来时无限刷提示。命中判定是 `not[\s_-]*multimodal` 正则，兼容 `NOT MULTIMODAL` / `not-multimodal` / `not_multimodal` 等变体。
+每轮注入条数由 `maxNotices` 封顶（默认 3，范围 1–10）；达到上限后再遇到同样的失败就记一条 `not-multimodal-skip` 并恢复正常报错，避免模型被反复路由回来时无限刷提示。命中判定是 `not[\s_-]*multimodal` 正则，兼容 `NOT MULTIMODAL` / `not-multimodal` / `not_multimodal` 等变体。
 
 对应配置（补丁行 `config.notMultimodal`，或设置分区里的「模型不支持多模态时」两个开关 + 条数）：
 
@@ -129,7 +129,7 @@ firstTokenTimeout:
 notMultimodal:
   enabled: true
   offloadImages: true   # 先把图片替换为占位说明再同一步重发；false = 只注入提示、交给路由换模型
-  maxNotices: 1         # 每轮最多注入几条（1–10）
+  maxNotices: 3         # 每轮最多注入几条（1–10）
   # text 可省略，默认文案见 host 文件 DEFAULT_NOT_MULTIMODAL
 ```
 
@@ -138,7 +138,7 @@ notMultimodal:
 
 1. **GUI 界面保存**：`~/.dsh/llm-error-retry/rules.json`（含设置分区与备用页，两处等价；跨重启持久，`npm` 升级不影响）。文件里除 `rules` 外还存 `honorRetryAfterMaxMs`（Retry-After 采信上限）、`firstTokenTimeout`（首字超时）与 `notMultimodal`（多模态提示）。
 2. `~/.dsh/cordis.patch.yml` 中同 id（`llm-error-retry`）覆盖行的 `config.rules`、`config.honorRetryAfterMaxMs`、`config.firstTokenTimeout` 与 `config.notMultimodal`。
-3. 本包内置默认（`cordis.patch.yml`）：`429 → 60s × 10`。
+3. 本包内置默认（`cordis.patch.yml`，与代码兜底默认一致）：8 条规则 `429`、`400`、`msg~finish_reason: error`、`msg~Provider returned an empty response`、`TRANSPORT`、`524`、`msg~病态重复`、`TIMEOUT`，均 `5s × 5`；`honorRetryAfterMaxMs` 10s、首字超时 90s、`notMultimodal.maxNotices` 3。
 
 运行快照与事件流水：`~/.dsh/llm-error-retry/status.json`（`config.dataDir` 可改数据目录）。
 

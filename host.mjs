@@ -7,6 +7,12 @@
  * 目录里堆满历史版本）。装插件时用包名（dsh-llm-error-retry）而不是文件路径，
  * 让它经 profile 的 node_modules 软链解析到真实目录。
  *
+ * 相比 v19（0.20.0）：内置默认配置改为作者当前线上配置——8 条规则均 5s × 5
+ * （429 / 400 / msg~finish_reason: error / msg~Provider returned an empty response /
+ * TRANSPORT / 524 / msg~病态重复 / TIMEOUT），honorRetryAfterMaxMs 10s、首字超时 90s、
+ * notMultimodal.maxNotices 3；代码兜底默认与包内 cordis.patch.yml 同步，新装即按这套规则
+ * 工作，不用再手工改补丁行或界面。
+ *
  * 相比 v15：新增「首字超时」（first-token timeout）。请求发出后若在设定时间内没有收到
  * 模型的第一个输出（文本 / 思考 / 工具调用都算输出），判定上游卡死，中断本次请求并按
  * 机器码 TIMEOUT 上报，让下面那套规则引擎接手（有 TIMEOUT 规则就休眠重试，没有就直接
@@ -78,7 +84,7 @@
  * 日志续——扫同一 session 已持久化的 llm/retry-started 事件得出链号与 retryId，
  * 会话因此可以被正常打开、重放。
  *
- * 配置来源（高→低）：<数据目录>/rules.json（界面保存）→ 补丁行 config.rules → 默认 429×60s×10。
+ * 配置来源（高→低）：<数据目录>/rules.json（界面保存）→ 补丁行 config.rules → 代码兜底默认（8 条规则 5s×5）。
  * 界面：GUI「设置」→「LLM 错误重试」；备用页 http://127.0.0.1:3080/llm-error-retry
  */
 import { randomUUID } from 'node:crypto'
@@ -89,7 +95,17 @@ import { join } from 'node:path'
 export const name = 'llm-error-retry'
 export const inject = ['timer', 'agents', 'sessions']
 
-const DEFAULT_RULES = [{ code: '429', delayMs: 60_000, maxRetries: 10 }]
+/** 代码兜底规则（与包内 cordis.patch.yml 同步）：一律 5 秒 × 5 次休眠重试。 */
+const DEFAULT_RULES = [
+  { code: '429', delayMs: 5_000, maxRetries: 5 },
+  { code: '400', delayMs: 5_000, maxRetries: 5 },
+  { code: 'msg~finish_reason: error', delayMs: 5_000, maxRetries: 5 },
+  { code: 'msg~Provider returned an empty response', delayMs: 5_000, maxRetries: 5 },
+  { code: 'TRANSPORT', delayMs: 5_000, maxRetries: 5 },
+  { code: '524', delayMs: 5_000, maxRetries: 5 },
+  { code: 'msg~病态重复', delayMs: 5_000, maxRetries: 5 },
+  { code: 'TIMEOUT', delayMs: 5_000, maxRetries: 5 },
+]
 const MIN_DELAY_MS = 100
 /** 规则 delayMs 与 maxTokens.delayMs 的允许上限（配置校验用）。 */
 const MAX_DELAY_MS = 3_600_000
@@ -98,15 +114,15 @@ const EVENT_LOG_LIMIT = 20
 const UI_PATH = '/llm-error-retry'
 /**
  * 服务端 Retry-After 高于规则 delayMs 时，最多允许推迟多久再试。
- * 默认 60s：上游常回 `Retry-After: 3600`（一小时），照做会让会话整小时不动，
+ * 默认 10s：上游常回 `Retry-After: 3600`（一小时），照做会让会话整小时不动，
  * 而用户设规则时的意图是「自己定节奏」。调大（最大 1h）表示更顺从服务端。
  */
-const DEFAULT_HONOR_RETRY_AFTER_MAX_MS = 60_000
+const DEFAULT_HONOR_RETRY_AFTER_MAX_MS = 10_000
 /**
  * 首字超时：请求发出后多久还没收到模型的第一个输出 chunk 就判定卡死。
- * 默认 180s 且默认开启——正常模型不会三分钟说不出一个字，而卡死的请求可以挂到天亮。
+ * 默认 90s 且默认开启——正常模型不会一分半说不出一个字，而卡死的请求可以挂到天亮。
  */
-const DEFAULT_FIRST_TOKEN_TIMEOUT = { enabled: true, timeoutMs: 180_000 }
+const DEFAULT_FIRST_TOKEN_TIMEOUT = { enabled: true, timeoutMs: 90_000 }
 /** 首字超时的允许范围：太小会把排队/长思考误判成卡死。 */
 const MIN_FIRST_TOKEN_TIMEOUT_MS = 1_000
 const MAX_FIRST_TOKEN_TIMEOUT_MS = 3_600_000
@@ -129,7 +145,7 @@ const FIRST_TOKEN_CHUNKS = new Set(['text-delta', 'reasoning-delta', 'tool-call-
 const DEFAULT_NOT_MULTIMODAL = {
   enabled: true,
   offloadImages: true,
-  maxNotices: 1,
+  maxNotices: 3,
   text: '【自动提示】上一条请求没有送达：当前模型不支持多模态（图片）输入，请求里的图片已替换为占位说明。请不要依赖图片，改用文字、坐标、文件内容或工具返回的文字描述继续当前任务；确实需要看图时，请切换到支持多模态的模型。',
 }
 /** 每轮最多注入几条提示的上限。 */
@@ -536,12 +552,12 @@ function renderPage() {
 (function () {
   var rows = [];
   var dirty = false;
-  var honorMs = 60000;
+  var honorMs = 10000;
   var ftEnabled = true;
-  var ftMs = 180000;
+  var ftMs = 90000;
   var nmEnabled = true;
   var nmOffload = true;
-  var nmMax = 1;
+  var nmMax = 3;
   function $(id) { return document.getElementById(id); }
   function setNotice(text, cls) { var n = $('notice'); n.textContent = text; n.className = 'notice' + (cls ? ' ' + cls : ''); }
   function markDirty() { dirty = true; }
@@ -657,14 +673,14 @@ function renderPage() {
       if (!keepDraft || !dirty) {
         var ft = state.firstTokenTimeout || {};
         ftEnabled = ft.enabled !== false;
-        ftMs = Number(ft.timeoutMs) || 180000;
+        ftMs = Number(ft.timeoutMs) || 90000;
         renderFirstToken();
       }
       if (!keepDraft || !dirty) {
         var nm = state.notMultimodal || {};
         nmEnabled = nm.enabled !== false;
         nmOffload = nm.offloadImages !== false;
-        nmMax = Number(nm.maxNotices) || 1;
+        nmMax = Number(nm.maxNotices) || 3;
         renderNotMultimodal();
       }
       applyState(state);

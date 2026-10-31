@@ -2,6 +2,17 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)；宿主半从 0.18.0 起只有**一个文件** `host.mjs`（此前各版本按 `host.vN.mjs` 发布，`vN` 是 DSH config-only HMR 不重载同路径模块的缓存失效手段，已在 0.18.0 取消——见该版本条目）。
 
+## 0.20.0 — 2026-10-31
+
+- **内置默认配置改为作者当前线上配置**：包内 `cordis.patch.yml` 与代码兜底默认同步，`dsh plugin add` 之后不用再手工改补丁行或界面，装完即按这套规则工作（备用页 / 设置分区里的兜底值同步）。
+  - 规则 8 条，均为 `5000ms × 5`：`429`、`400`、`msg~finish_reason: error`、`msg~Provider returned an empty response`、`TRANSPORT`、`524`、`msg~病态重复`、`TIMEOUT`。最后一条让首字超时产出的合成 `TIMEOUT` 失败也能自动重来。
+  - `honorRetryAfterMaxMs` 60000 → 10000：服务端 `Retry-After` 最多让等待多延 10 秒，不再被上游的一小时提示带走。
+  - `firstTokenTimeout.timeoutMs` 180000 → 90000。
+  - `notMultimodal.maxNotices` 1 → 3（提示文案本来就是现在的默认文案，不变）。
+  - `maxTokens`（截断自动续写）默认值不变。
+- 优先级不变：界面保存的 `<数据目录>/llm-error-retry/rules.json` > HOME 层 `cordis.patch.yml` 同 id 行 > 本包内置默认。已有部署不会被「升级默认值」改写行为（`rules.json` 仍优先）。
+- 宿主半：`host.mjs`。
+
 ## 0.19.0 — 2026-10-28
 
 - **修复：模型不支持多模态时本轮仍以失败收尾**（0.17.0 的遗留问题）。0.17.0 只往上下文注入提示就 `next()` 放行，失败照样抛给用户、本轮 `turn/end` 仍是 `error`——用户看到「本轮运行失败：The request model is not multimodal」，提示注入了却没起到作用。

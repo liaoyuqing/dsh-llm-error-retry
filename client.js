@@ -126,7 +126,7 @@ window.__ModuleLoader__.load({
       }
 
       function Section() {
-        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 180000 }, notMultimodal: { enabled: true, offloadImages: true, maxNotices: 1 } });
+        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 90000 }, notMultimodal: { enabled: true, offloadImages: true, maxNotices: 3 } });
         var snap = snapPair[0]; var setSnap = snapPair[1];
         var draftPair = React.useState(null);
         var draft = draftPair[0]; var setDraft = draftPair[1];
@@ -147,8 +147,8 @@ window.__ModuleLoader__.load({
                 waiting: cfg.waiting || 0, source: cfg.source || "", error: "",
                 notice: keepNotice ? prev.notice : "",
                 honorRetryAfterMaxMs: Number(cfg.honorRetryAfterMaxMs) || 0,
-                firstTokenTimeout: cfg.firstTokenTimeout || { enabled: true, timeoutMs: 180000 },
-                notMultimodal: cfg.notMultimodal || { enabled: true, offloadImages: true, maxNotices: 1 },
+                firstTokenTimeout: cfg.firstTokenTimeout || { enabled: true, timeoutMs: 90000 },
+                notMultimodal: cfg.notMultimodal || { enabled: true, offloadImages: true, maxNotices: 3 },
               };
             });
           }).catch(function (e) {

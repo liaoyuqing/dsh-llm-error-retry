@@ -8,7 +8,7 @@ body:
       label: 现象 / What happened
       description: 哪个规则没命中 / 没休眠 / 界面异常？贴 status.json 的 lastEvents 片段最好
       placeholder: |
-        rules: 429 -> 60s x10
+        rules: 429 -> 5s x5
         expected: sleep then retry
         actual: error propagated immediately
     validations:

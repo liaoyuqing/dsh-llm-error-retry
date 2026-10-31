@@ -1,25 +1,25 @@
 # dsh-llm-error-retry — Profile Bundle 自带补丁：把宿主半插进 host 组合。
 # 浏览器半（设置页分区）由 client-modules 扫描本包 package.json 的 dsh.client 声明自动并入 GUI 启动图。
-# 默认规则在这里定义；日常改规则请直接用 GUI（设置 → LLM 错误重试），
-# 它会写入 ~/.dsh/llm-error-retry/rules.json 并优先于本文件。
+# 这里就是**本包内置默认配置**：装完即按这套规则工作，日常改规则请直接用 GUI
+# （设置 → LLM 错误重试），它写入 <数据目录>/llm-error-retry/rules.json 并优先于本文件；
+# 首字超时 / Retry-After 采信上限 / 多模态提示与规则同一优先级（界面文件 > HOME 补丁行 > 本文件）。
 # 想固定改 YAML：在 ~/.dsh/cordis.patch.yml 加同 id 行整体覆盖 config（HOME 层优先于 bundle 层）。
 - insert:
     - id: llm-error-retry
       name: ./host.mjs
       config:
-        # 模型不支持多模态时：自动往上下文注入提示，而不是直接报错。
+        # 模型不支持多模态时：先省略图片再注入提示，同一步重发，本轮不以失败收尾。
         notMultimodal:
           enabled: true
-          # 先把请求里未省略的图片标记为已省略（占位文字代替图片字节），使同一步重发能成功。
-          offloadImages: true
-          maxNotices: 1    # 每轮最多注入几条（1–10）；text 省略则用内置文案
-        # 服务端 Retry-After 提示最多被采信多久（毫秒）。0 = 完全忽略提示、只按规则节奏。
-        honorRetryAfterMaxMs: 60000
-        # 首字超时：请求发出后多久还没有第一个字（正文/思考/工具调用任一）就中断本次请求
-        # 并按 TIMEOUT 失败上报。可再配一条规则码 TIMEOUT 让它自动重试。范围 1000–3600000 毫秒。
+          offloadImages: true   # 先把请求里的图片换成占位说明；false = 只注入提示、交给路由换模型
+          maxNotices: 3         # 每轮最多注入几条（1–10）
+        # 服务端 Retry-After 最多被采信多久（毫秒）：0 = 完全忽略提示、只按规则节奏。
+        honorRetryAfterMaxMs: 10000
+        # 首字超时：请求发出后多久还没有第一个字（正文/思考/工具调用任一）就中断本次请求，
+        # 并按 TIMEOUT 失败上报——下面那条 TIMEOUT 规则会让它自动重试。范围 1000–3600000 毫秒。
         firstTokenTimeout:
           enabled: true
-          timeoutMs: 180000
+          timeoutMs: 90000
         # 模型输出达到 token 上限被截断时，自动注入一条消息让它接着输出（免人工打「继续」）
         maxTokens:
           enabled: true      # 关掉则恢复原样：截断后等你手动继续
@@ -30,13 +30,29 @@
           restartTurns: 10   # 轮次以粘性 max-tokens 收尾时，最多连开 10 个新轮
           restartDelayMs: 1200  # 重开前等旧 driver 收敛的时间（不能省：running 阶段
                              # 投递的唤醒会被 agent-loop 丢弃）
+        # 默认规则：均 5 秒 × 5 次休眠重试；按顺序取第一条命中，未命中一律原样放行。
         rules:
-          - code: '429'        # HTTP 状态码 429（限流）；也可写机器码 RATE_LIMIT
-            delayMs: 60000     # 命中后休眠 60 秒再重新请求
-            maxRetries: 10     # 该错误码最多重试 10 次，耗尽后错误上报
-          - code: 'msg~finish_reason: error'
-            delayMs: 10000     # provider 以 finish_reason 终止请求：休眠 10 秒重试
-          # 更多规则按同样格式追加（按顺序取第一条命中），例如按 provider 响应字段命中：
-          # - code: type=insufficient_quota
-          #   delayMs: 60000
-          #   maxRetries: 10
+          - code: '429'                 # HTTP 429 限流（与机器码 RATE_LIMIT 等价）
+            delayMs: 5000
+            maxRetries: 5
+          - code: '400'                 # 请求体被上游/网关判为无效
+            delayMs: 5000
+            maxRetries: 5
+          - code: 'msg~finish_reason: error'  # provider 以未识别的 finish_reason 终止流
+            delayMs: 5000
+            maxRetries: 5
+          - code: 'msg~Provider returned an empty response'  # 只有一句文案的空回复
+            delayMs: 5000
+            maxRetries: 5
+          - code: 'TRANSPORT'           # 传输类失败：流被截断、upstream request failed 等
+            delayMs: 5000
+            maxRetries: 5
+          - code: '524'                 # 网关等待上游超时
+            delayMs: 5000
+            maxRetries: 5
+          - code: 'msg~病态重复'         # 网关判定模型思考陷入病态重复、已中止本轮
+            delayMs: 5000
+            maxRetries: 5
+          - code: 'TIMEOUT'             # 首字超时产出的合成失败码：卡死请求自动重来
+            delayMs: 5000
+            maxRetries: 5
