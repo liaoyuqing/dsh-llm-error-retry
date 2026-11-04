@@ -54,6 +54,10 @@ check(host.includes("'session/event'"), 'host: cross-turn restart must observe s
 // First-token timeout is an llm/stream middleware: the seam is registered as a waterfall.
 check(host.includes("'llm/stream'"), 'host: first-token timeout must hook llm/stream')
 check(host.includes('firstTokenTimeout'), 'host: first-token timeout must stay configurable')
+// status.json 的 version 必须来自 package.json：写死字面量会在每次发版时漏改，
+// 让「没热重载」和「版本号忘了改」在诊断时看起来是同一件事（0.20.0 就漏过一次）。
+check(host.includes('PLUGIN_VERSION'), 'host: status.json version must come from package.json')
+check(!/\bversion:\s*'\d+\.\d+\.\d+'/.test(host), 'host: status.json version must not be a hardcoded semver literal')
 // Headers must go through setHeader/end only — a pinned content-length (setHeader or
 // writeHead literal) fights the gzip middleware. Comments mentioning it are fine.
 check(!/setHeader\(\s*['"]content-length/i.test(host), 'host: never setHeader content-length (gzip conflict)')

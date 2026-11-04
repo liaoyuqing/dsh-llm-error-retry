@@ -13,6 +13,10 @@
  * notMultimodal.maxNotices 3；代码兜底默认与包内 cordis.patch.yml 同步，新装即按这套规则
  * 工作，不用再手工改补丁行或界面。
  *
+ * 0.20.1（本版）：修 0.20.0 发布时漏改的 status.json 版本号——它当时写死 '0.19.0'，
+ * 于是重载后快照仍报旧版本，把「没热重载」与「版本号忘了改」混成一件事。现在从
+ * 同目录 package.json 读，读不到退 'unknown'；scripts/validate.mjs 加了对应断言。
+ *
  * 相比 v15：新增「首字超时」（first-token timeout）。请求发出后若在设定时间内没有收到
  * 模型的第一个输出（文本 / 思考 / 工具调用都算输出），判定上游卡死，中断本次请求并按
  * 机器码 TIMEOUT 上报，让下面那套规则引擎接手（有 TIMEOUT 规则就休眠重试，没有就直接
@@ -90,10 +94,26 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 export const name = 'llm-error-retry'
 export const inject = ['timer', 'agents', 'sessions']
+
+/**
+ * 本插件版本，写进 status.json 供「活进程到底加载了哪一版」取证。
+ * 从同目录 package.json 读，避免发布时手工同步漏改（0.20.0 就漏过一次，
+ * status.json 一直报 0.19.0，把「没热重载」和「版本号没改」混成同一个现象）。
+ * 读不到时退回 'unknown'：版本号只用于诊断，不能让插件因此起不来。
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    const manifest = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8'))
+    return typeof manifest.version === 'string' && manifest.version.trim() !== '' ? manifest.version : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+})()
 
 /** 代码兜底规则（与包内 cordis.patch.yml 同步）：一律 5 秒 × 5 次休眠重试。 */
 const DEFAULT_RULES = [
@@ -821,7 +841,7 @@ export function apply(ctx, config = {}) {
         status: 'mounted',
         mountedAt: new Date().toISOString(),
         pid: process.pid,
-        version: '0.19.0',
+        version: PLUGIN_VERSION,
         rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
         rulesSource,
         firstTokenTimeout,
