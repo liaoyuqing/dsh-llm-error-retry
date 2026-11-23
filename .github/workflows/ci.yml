@@ -15,3 +15,5 @@ jobs:
           node-version: 22
       - name: Validate package shape and syntax
         run: node scripts/validate.mjs
+      - name: Rule-file migration and defaults behaviour
+        run: node scripts/selfcheck.mjs

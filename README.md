@@ -140,6 +140,12 @@ notMultimodal:
 2. `~/.dsh/cordis.patch.yml` 中同 id（`llm-error-retry`）覆盖行的 `config.rules`、`config.honorRetryAfterMaxMs`、`config.firstTokenTimeout` 与 `config.notMultimodal`。
 3. 本包内置默认（`cordis.patch.yml`，与代码兜底默认一致）：8 条规则 `429`、`400`、`msg~finish_reason: error`、`msg~Provider returned an empty response`、`TRANSPORT`、`524`、`msg~病态重复`、`TIMEOUT`，均 `5s × 5`；`honorRetryAfterMaxMs` 10s、首字超时 90s、`notMultimodal.maxNotices` 3。
 
+**内置默认总是显示在列表里，可改可删。** 界面上那张表就是当前生效的全部规则，不存在「藏在下面、看不见也改不了」的默认。
+
+- 首次读到 0.20.x 及更早写出的 `rules.json`（没有 `configVersion` 字段）时，会把缺失的默认按 `code` 去重补在后面并就地升级成 `configVersion: 2`：你自己配过的码保持原位置和原参数，默认只补空缺。挂载日志会写明补了几条。
+- 之后列表即权威：把某条默认删掉再保存，它不会再被补回来（2 号文件里没有的码不会复活）。想整份回到默认，点「恢复默认规则」再保存。
+- 把列表保存成空、等于关掉规则引擎（所有失败都交给下游 model-failover 路由）。
+
 运行快照与事件流水：`~/.dsh/llm-error-retry/status.json`（`config.dataDir` 可改数据目录）。
 
 ## 工作原理

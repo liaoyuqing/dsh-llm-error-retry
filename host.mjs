@@ -13,7 +13,14 @@
  * notMultimodal.maxNotices 3；代码兜底默认与包内 cordis.patch.yml 同步，新装即按这套规则
  * 工作，不用再手工改补丁行或界面。
  *
- * 0.20.1（本版）：修 0.20.0 发布时漏改的 status.json 版本号——它当时写死 '0.19.0'，
+ * 0.21.0（本版）：**内置默认规则回到列表里**。0.20.x 读到规则文件就整体替换生效集，
+ * 于是老部署的 rules.json（只有用户当时存的那几条）把 0.20.0 新写的 8 条默认挡在外面——
+ * 它们既不在界面上，也删不掉，看起来像「默认配置丢了」。现在规则文件带 `configVersion`：
+ * 读到旧文件（无此字段）就按 `code` 去重把默认补在后面并就地升级；此后列表即权威，
+ * 界面删掉一条再保存不会再被补回来；另加「恢复默认规则」一键换回部署默认。
+ * 行为由 scripts/selfcheck.mjs 覆盖（真跑 apply() 与配置路由，不只是断言源码字符串）。
+ *
+ * 0.20.1：修 0.20.0 发布时漏改的 status.json 版本号——它当时写死 '0.19.0'，
  * 于是重载后快照仍报旧版本，把「没热重载」与「版本号忘了改」混成一件事。现在从
  * 同目录 package.json 读，读不到退 'unknown'；scripts/validate.mjs 加了对应断言。
  *
@@ -88,6 +95,12 @@
  * 日志续——扫同一 session 已持久化的 llm/retry-started 事件得出链号与 retryId，
  * 会话因此可以被正常打开、重放。
  *
+ * 0.21.0（本版）：**内置默认规则回到列表里**。0.20.x 读到规则文件就整体替换生效集，
+ * 于是老部署的 rules.json（只有用户当时存的那几条）把新写的 8 条默认挡在外面——它们既
+ * 不在界面上，也删不掉，看起来像「默认配置丢了」。现在规则文件带 `configVersion`：
+ * 读到旧文件（无此字段）就按 `code` 去重把默认补在后面并就地升级，此后列表即权威，
+ * 界面删掉一条再保存不会再被补回来；另加「恢复内置默认」一键重置。
+ *
  * 配置来源（高→低）：<数据目录>/rules.json（界面保存）→ 补丁行 config.rules → 代码兜底默认（8 条规则 5s×5）。
  * 界面：GUI「设置」→「LLM 错误重试」；备用页 http://127.0.0.1:3080/llm-error-retry
  */
@@ -115,8 +128,20 @@ const PLUGIN_VERSION = (() => {
   }
 })()
 
-/** 代码兜底规则（与包内 cordis.patch.yml 同步）：一律 5 秒 × 5 次休眠重试。 */
-const DEFAULT_RULES = [
+/**
+ * 规则文件格式版本。1（缺省）= 0.20.x 及更早写出的文件，里面只有用户自己加/改过的规则；
+ * 2 = 完整列表，文件里有什么就生效什么。
+ *
+ * 为什么要这个标记：0.20.x 的 `loadRulesFile()` 一旦发现文件存在就**整体替换**生效规则集，
+ * 于是更早版本保存过的 rules.json（只有当时那几条）会把 0.20.x 新写的 8 条内置默认完全
+ * 挡在外面——它们既不在界面上，也删不掉，用户看到的是「默认配置凭空消失」。
+ * 2 号文件由本版本首次读到 1 号文件时合并写出（见 `mergeRulesWithDefaults`），此后
+ * 列表即权威：删掉一条再保存，它不会再被内置默认复活。
+ */
+const CONFIG_VERSION = 2
+
+/** 内置默认规则（与包内 cordis.patch.yml 同步）：一律 5 秒 × 5 次休眠重试。 */
+export const DEFAULT_RULES = [
   { code: '429', delayMs: 5_000, maxRetries: 5 },
   { code: '400', delayMs: 5_000, maxRetries: 5 },
   { code: 'msg~finish_reason: error', delayMs: 5_000, maxRetries: 5 },
@@ -389,7 +414,13 @@ function isNotMultimodalFailure(failure) {
   return NOT_MULTIMODAL_PATTERN.test(message)
 }
 
-function validateRules(input) {
+/**
+ * Validate a rule list.
+ * @param {unknown} input - raw `rules` array from the patch row, rules file, or the UI.
+ * @returns {Array<{ code: string, tag: string, delayMs: number, maxRetries: number, match: object }>} rules with their parsed matchers.
+ * @throws {Error} when an entry is malformed, duplicated, or out of range.
+ */
+export function validateRules(input) {
   if (input !== undefined && !Array.isArray(input)) throw new Error('llm-error-retry: rules must be an array of { code, delayMs, maxRetries }')
   const out = []
   const seen = new Set()
@@ -415,6 +446,31 @@ function validateRules(input) {
     out.push({ code, tag, delayMs, maxRetries, match })
   }
   return out
+}
+
+/**
+ * 把内置默认规则补到一份旧格式（`configVersion` 不是 2）的规则集后面。
+ *
+ * 只按 `code` 去重：用户自己配过同一个错误码就以用户的为准（连同它的 delayMs 与
+ * maxRetries），默认的那条不再出现。顺序保持「用户的在前、补进来的在后」——`matchAgainst`
+ * 按顺序取第一条命中，把默认塞到前面会改变用户已有规则的优先级。
+ *
+ * 这两个入参都必须是 `validateRules` 的产物（带 `tag` 与 `match`）。
+ * @param {Array<object>} fileRules - validated rules read from the rules file.
+ * @param {Array<object>} defaults - validated built-in default rules.
+ * @returns {{ rules: Array<object>, added: string[] }} merged list plus the codes appended.
+ */
+export function mergeRulesWithDefaults(fileRules, defaults) {
+  const seen = new Set(fileRules.map((rule) => rule.tag))
+  const merged = [...fileRules]
+  const added = []
+  for (const rule of defaults) {
+    if (seen.has(rule.tag)) continue
+    seen.add(rule.tag)
+    merged.push(rule)
+    added.push(rule.code)
+  }
+  return { rules: merged, added }
 }
 
 function scalarEq(actual, value) {
@@ -483,7 +539,12 @@ function snapshotFailure(failure) {
   }
 }
 
-function renderPage() {
+/**
+ * 渲染备用配置页。
+ * @param {Array<{ code: string, delayMs: number, maxRetries: number }>} defaults - deployment default rules for the reset button.
+ * @returns {string} the full HTML document.
+ */
+function renderPage(defaults) {
   return `<!doctype html>
 <html lang="zh">
 <head>
@@ -531,6 +592,7 @@ function renderPage() {
   </table>
   <div class="toolbar">
     <button id="add">＋ 添加规则</button>
+    <button id="defaults" title="换成部署默认：补丁行的 config.rules；补丁行没写就是代码里的内置默认">恢复默认规则</button>
     <button id="save" class="primary">保存（立即生效）</button>
     <button id="revert">放弃本地修改</button>
   </div>
@@ -565,12 +627,13 @@ function renderPage() {
     </div>
     <div class="settings-help">上游回 <code>The request model is not multimodal</code> 时不把错误抛给用户：先把本请求里还没省略的图片标记为「已省略」（与宿主 compaction-image-offload 共用同一份持久决定，之后装配的请求用占位文字代替图片字节，人类对话里的原图不受影响），再往会话里追加一条模型可见的自动提示，然后<b>同一步重发</b>——本轮继续跑、不以失败收尾，模型会照常给出文字回答或提示你换模型。找不到可省略的图片时退回旧行为：只注入提示并放行给模型路由（model-failover）换模型。范围 1–10 条，取消勾选 = 关闭（恢复直接报错）。</div>
   </div>
-  <div class="hint">规则码四种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）；④ <b>msg~子串</b>（如 <code>msg~finish_reason: error</code>：忽略大小写地子串匹配失败 message，用于没有 status、只有一句文本的失败，例如 provider 用 finish_reason 终止请求时的 <code>Provider finish_reason: error</code>）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~1000（0 = 命中即上报）。服务端 Retry-After 更长时按提示推迟，但会被下方「服务端 Retry-After 采信上限」截断——上游的 <code>Retry-After: 3600</code> 不会让你等满一小时。休眠/重试过程显示在会话框重试卡片中。保存写入 ~/.dsh/llm-error-retry/rules.json 并立即生效；删除该文件回落到 cordis.patch.yml 默认规则。</div>
+  <div class="hint">规则码四种形态：① HTTP 状态码数字（429、500…：匹配 HTTP status、失败 code 和 message 中的独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER、TRANSPORT、TIMEOUT、EMPTY_RESPONSE…，忽略大小写）；③ <b>字段=值</b>（如 <code>code=insufficient_quota</code>、<code>type=rate_limit_exceeded</code>：匹配 provider 返回 JSON 的字段，含被压平进 message 的响应体）；④ <b>msg~子串</b>（如 <code>msg~finish_reason: error</code>：忽略大小写地子串匹配失败 message，用于没有 status、只有一句文本的失败，例如 provider 用 finish_reason 终止请求时的 <code>Provider finish_reason: error</code>）。多条规则按顺序取第一条命中。delayMs 范围 100~3600000 毫秒；次数 0~1000（0 = 命中即上报）。服务端 Retry-After 更长时按提示推迟，但会被下方「服务端 Retry-After 采信上限」截断——上游的 <code>Retry-After: 3600</code> 不会让你等满一小时。休眠/重试过程显示在会话框重试卡片中。表里就是全部生效规则：默认规则也写在表里、可直接改或删（删掉再保存就不会再被补回来），「恢复默认规则」把列表整份换回补丁行的 config.rules。</div>
   <div class="sub" style="margin-top:18px"><b>最近活动</b></div>
   <ul id="events"><li>加载中…</li></ul>
 <script>
 (function () {
   var rows = [];
+  var DEFAULT_RULES = ${JSON.stringify(defaults)};
   var dirty = false;
   var honorMs = 10000;
   var ftEnabled = true;
@@ -740,6 +803,11 @@ function renderPage() {
     markDirty();
   };
   $('add').onclick = function () { rows.push({ code: '', delayMs: 60000, maxRetries: 10 }); markDirty(); renderRows(); };
+  $('defaults').onclick = function () {
+    rows = DEFAULT_RULES.map(function (r) { return { code: r.code, delayMs: r.delayMs, maxRetries: r.maxRetries }; });
+    markDirty(); renderRows();
+    setNotice('已填入内置默认 ' + rows.length + ' 条；保存后才生效（会覆盖当前列表）', 'ok');
+  };
   $('revert').onclick = function () { dirty = false; refresh(false); setNotice('已放弃本地修改', 'ok'); };
   $('save').onclick = function () {
     var payload = {
@@ -791,6 +859,8 @@ export function apply(ctx, config = {}) {
 
   let rules = yamlRules
   let rulesSource = 'yaml-default'
+  /** 迁移时补进规则的默认错误码，供挂载日志说明「这次为什么多出几行」。 */
+  let migratedDefaults = []
   /** 服务端 Retry-After 的采信上限：界面保存值优先于补丁行，保存后即时生效。 */
   let honorRetryAfterMaxMs = yamlHonorRetryAfter
   /** 首字超时：界面保存值优先于补丁行，保存后即时生效。 */
@@ -805,11 +875,24 @@ export function apply(ctx, config = {}) {
   let disposed = false
   let seq = 0
 
+  /**
+   * 写出规则文件。带上 `configVersion: 2`，此后该文件就是完整列表：
+   * 读到 2 号文件不再补默认，用户删掉的默认规则不会复活。
+   */
+  function persistRules() {
+    writeFileSync(rulesFile, JSON.stringify({
+      configVersion: CONFIG_VERSION,
+      rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
+      honorRetryAfterMaxMs,
+      firstTokenTimeout,
+      notMultimodal,
+    }, null, 2))
+  }
+
   function loadRulesFile() {
     try {
       if (!existsSync(rulesFile)) { rules = yamlRules; rulesSource = 'yaml-default'; honorRetryAfterMaxMs = yamlHonorRetryAfter; firstTokenTimeout = yamlFirstToken; notMultimodal = yamlNotMultimodal; return }
       const parsed = JSON.parse(readFileSync(rulesFile, 'utf8'))
-      rules = validateRules(parsed.rules)
       // 设置单独校验：坏值只忽略它自己，不连累规则整体回落到 yaml 默认。
       if (parsed.honorRetryAfterMaxMs !== undefined) {
         try { honorRetryAfterMaxMs = validateHonorRetryAfter(parsed.honorRetryAfterMaxMs) } catch {}
@@ -820,7 +903,22 @@ export function apply(ctx, config = {}) {
       if (parsed.notMultimodal !== undefined) {
         try { notMultimodal = validateNotMultimodal(parsed.notMultimodal) } catch {}
       }
+      const fileRules = validateRules(parsed.rules)
+      if (parsed.configVersion === CONFIG_VERSION) {
+        rules = fileRules
+        rulesSource = 'file'
+        return
+      }
+      // 旧文件（0.20.x 及更早写的）只存了用户当时那几条，内置默认既不在生效集也不在界面上。
+      // 补进默认并就地升级成 2 号文件，否则「默认配置」对老部署永远不可见。
+      const merged = mergeRulesWithDefaults(fileRules, yamlRules)
+      rules = merged.rules
       rulesSource = 'file'
+      migratedDefaults = merged.added
+      try { persistRules() } catch (error) {
+        // 写不进去也不影响本次生效：规则已经合并好了。下次启动再试一次迁移。
+        ctx.logger.warn(`llm-error-retry: 规则文件迁移到 configVersion ${CONFIG_VERSION} 失败（${String((error && error.message) || error)}）；本次仍按合并后的规则运行`)
+      }
     } catch (error) {
       rules = yamlRules
       honorRetryAfterMaxMs = yamlHonorRetryAfter
@@ -1371,13 +1469,14 @@ export function apply(ctx, config = {}) {
       res.statusCode = 200
       res.setHeader('content-type', 'text/html; charset=utf-8')
       res.setHeader('cache-control', 'no-store')
-      res.end(renderPage())
+      res.end(renderPage(yamlRules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries }))))
       return
     }
     if (path === `${UI_PATH}/api/config`) {
       if (req.method === 'GET' || req.method === 'HEAD') {
         sendJson(res, 200, {
           rules: rules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
+          defaults: yamlRules.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
           honorRetryAfterMaxMs,
           firstTokenTimeout,
           notMultimodal,
@@ -1400,17 +1499,14 @@ export function apply(ctx, config = {}) {
         const nextNotMultimodal = body.notMultimodal === undefined
           ? notMultimodal
           : validateNotMultimodal(body.notMultimodal)
-        writeFileSync(rulesFile, JSON.stringify({
-          rules: next.map(({ code, delayMs, maxRetries }) => ({ code, delayMs, maxRetries })),
-          honorRetryAfterMaxMs: nextHonor,
-          firstTokenTimeout: nextFirstToken,
-          notMultimodal: nextNotMultimodal,
-        }, null, 2))
         rules = next
         honorRetryAfterMaxMs = nextHonor
         firstTokenTimeout = nextFirstToken
         notMultimodal = nextNotMultimodal
         rulesSource = 'file'
+        migratedDefaults = []
+        // 整份列表落盘（含 configVersion），删掉的默认规则因此不会再被补回来。
+        persistRules()
         record({ type: 'saved', source: 'ui', rules: rules.map(({ code, delayMs, maxRetries }) => `${code}->${delayMs}ms x${maxRetries}`), honorRetryAfterMaxMs, firstTokenTimeout: nextFirstToken, notMultimodal: nextNotMultimodal })
         ctx.logger.info(`llm-error-retry: rules saved via UI -> ${rules.map(({ code, delayMs, maxRetries }) => `${code}->${Math.round(delayMs / 1000)}s x${maxRetries}`).join(', ') || '(none, pass-through)'}; Retry-After 采信上限 ${Math.round(nextHonor / 1000)}s${nextHonor === 0 ? '（忽略服务端提示）' : ''}`)
         sendJson(res, 200, { ok: true })
@@ -1454,6 +1550,9 @@ export function apply(ctx, config = {}) {
   })
 
   record({ type: 'mounted', rules: rules.map(({ code, delayMs, maxRetries }) => `${code}->${delayMs}ms x${maxRetries}`) })
+  if (migratedDefaults.length > 0) {
+    ctx.logger.info(`llm-error-retry: 旧的规则文件缺少内置默认，已补入 ${migratedDefaults.length} 条（${migratedDefaults.join(', ')}）并升级为 configVersion ${CONFIG_VERSION}；原有规则的位置与参数不变`)
+  }
   ctx.logger.info(`llm-error-retry: mounted with ${rules.length} rule(s) [source: ${rulesSource}] -> ${rules.map(({ code, delayMs, maxRetries }) => `${code}->${Math.round(delayMs / 1000)}s x${maxRetries}`).join(', ') || '(none, pass-through)'}; 首字超时 ${firstTokenTimeout.enabled ? Math.round(firstTokenTimeout.timeoutMs / 1000) + 's' : '已关闭'}`)
 
   ctx.effect(() => () => {

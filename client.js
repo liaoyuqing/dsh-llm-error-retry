@@ -126,7 +126,7 @@ window.__ModuleLoader__.load({
       }
 
       function Section() {
-        var snapPair = React.useState({ loading: true, rules: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 90000 }, notMultimodal: { enabled: true, offloadImages: true, maxNotices: 3 } });
+        var snapPair = React.useState({ loading: true, rules: [], defaults: [], activity: [], waiting: 0, source: "", error: "", notice: "", honorRetryAfterMaxMs: 0, firstTokenTimeout: { enabled: true, timeoutMs: 90000 }, notMultimodal: { enabled: true, offloadImages: true, maxNotices: 3 } });
         var snap = snapPair[0]; var setSnap = snapPair[1];
         var draftPair = React.useState(null);
         var draft = draftPair[0]; var setDraft = draftPair[1];
@@ -143,7 +143,7 @@ window.__ModuleLoader__.load({
           getJson().then(function (cfg) {
             setSnap(function (prev) {
               return {
-                loading: false, rules: cfg.rules, activity: cfg.lastEvents || [],
+                loading: false, rules: cfg.rules, defaults: cfg.defaults || [], activity: cfg.lastEvents || [],
                 waiting: cfg.waiting || 0, source: cfg.source || "", error: "",
                 notice: keepNotice ? prev.notice : "",
                 honorRetryAfterMaxMs: Number(cfg.honorRetryAfterMaxMs) || 0,
@@ -153,7 +153,7 @@ window.__ModuleLoader__.load({
             });
           }).catch(function (e) {
             setSnap(function (prev) {
-              return { loading: false, rules: prev.rules, activity: prev.activity, waiting: 0, source: prev.source, error: String((e && e.message) || e), notice: prev.notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout, notMultimodal: prev.notMultimodal };
+              return { loading: false, rules: prev.rules, defaults: prev.defaults, activity: prev.activity, waiting: 0, source: prev.source, error: String((e && e.message) || e), notice: prev.notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout, notMultimodal: prev.notMultimodal };
             });
           });
         }
@@ -187,7 +187,14 @@ window.__ModuleLoader__.load({
         }
         function addRow() { setDraft(function () { var b = base(); b.push({ code: "", delayMs: 60000, maxRetries: 10 }); return b; }); }
         function removeRow(i) { setDraft(function () { var b = base(); b.splice(i, 1); return b; }); }
-        function setNotice(notice) { setSnap(function (prev) { return { loading: false, rules: prev.rules, activity: prev.activity, waiting: prev.waiting, source: prev.source, error: "", notice: notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout, notMultimodal: prev.notMultimodal }; }); }
+        /** 用部署默认（补丁行 config.rules，未配置时是代码内置的 8 条）整份替换列表。 */
+        function resetToDefaults() {
+          var defaults = cloneRules(snap.defaults);
+          if (defaults.length === 0) { setNotice("宿主没提供默认规则，无法重置"); return; }
+          setDraft(defaults);
+          setNotice("已填入默认规则 " + defaults.length + " 条；点「保存」后生效");
+        }
+        function setNotice(notice) { setSnap(function (prev) { return { loading: false, rules: prev.rules, defaults: prev.defaults, activity: prev.activity, waiting: prev.waiting, source: prev.source, error: "", notice: notice, honorRetryAfterMaxMs: prev.honorRetryAfterMaxMs, firstTokenTimeout: prev.firstTokenTimeout, notMultimodal: prev.notMultimodal }; }); }
         function save() {
           var payload = rows
             .filter(function (r) { return String(r.code).trim() !== ""; })
@@ -210,6 +217,7 @@ window.__ModuleLoader__.load({
             + " ｜ 首字超时 " + (first.enabled === false ? "已关闭" : Math.round(first.timeoutMs / 1000) + "s")
             + " ｜ 多模态 " + (nm.enabled === false ? "已关闭" : (nm.offloadImages === false ? "仅提示 " : "省略图片+提示 ") + nm.maxNotices + " 条/轮")
             + " ｜ 来源：" + (snap.source === "file" ? "本界面保存" : "cordis.patch.yml 默认值")
+            + " ｜ 可恢复默认 " + snap.defaults.length + " 条"
           )));
           if (snap.waiting > 0) children.push(e("div", { style: S.warn, key: "w" }, "当前有 " + snap.waiting + " 个请求正在休眠等待重试…"));
 
@@ -231,7 +239,8 @@ window.__ModuleLoader__.load({
           });
           children.push(e("table", { style: S.table, key: "tbl" }, head, e("tbody", null, bodyRows)));
           children.push(e("div", { style: S.toolbar, key: "bar" },
-            e("button", { style: S.btn, onClick: addRow }, "＋ 添加错误码"),
+            e("button", { style: S.btn, key: "add", onClick: addRow }, "＋ 添加错误码"),
+            e("button", { style: S.btn, key: "def", onClick: resetToDefaults, title: "把列表整份换成默认的 " + snap.defaults.length + " 条（补丁行 config.rules；保存后生效）" }, "恢复默认规则"),
             (dirtyTotal) ? e("button", { style: S.primary, key: "save", onClick: save }, "保存（立即生效）") : null,
             (dirtyTotal) ? e("button", { style: S.btn, key: "discard", onClick: discard }, "放弃修改") : null));
           children.push(e("div", { style: S.settings, key: "st" },
@@ -316,7 +325,7 @@ window.__ModuleLoader__.load({
               "上游回 The request model is not multimodal 时不把这次失败抛给用户，本轮也不以失败收尾：先落一条持久的 image/offload 决定，把请求里未省略的图片换成占位说明（含图片只读路径），装配出的下一个请求就能被纯文本模型接受；再往会话里追加一条模型可见的提示，然后同一步重发——模型改用文字继续回答，聊天区不出现失败行。省略只作用于模型可见的请求，你贴的原图仍在对话里。取消「先把图片替换为占位说明」则退回只注入提示，交给模型路由把该模型标记为失败并换到组内支持多模态的模型。范围 1–10 条，取消「自动处置」= 关闭（恢复直接报错）。")));
           if (snap.notice !== "") children.push(e("div", { style: snap.notice.indexOf("失败") >= 0 ? S.err : S.ok, key: "n" }, snap.notice));
           if (snap.error !== "") children.push(e("div", { style: S.err, key: "e" }, "宿主接口异常：" + snap.error + "（若插件刚重启稍候自动恢复）"));
-          children.push(e("div", { style: S.hint, key: "h" }, "规则码四种形态：① HTTP 状态码（429、500…：匹配 status、code 与 message 中独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER…）；③ 字段=值（如 code=insufficient_quota、type=rate_limit_exceeded：匹配 provider 返回 JSON 字段，含被压平进 message 的响应体）；④ msg~子串（如 msg~finish_reason: error：忽略大小写地子串匹配失败 message，用于 provider 用 finish_reason 终止请求时报的 Provider finish_reason: error，此时既无 status 也只有通用 code PI_AI_ERROR）。多条规则按顺序取第一条命中。次数上限 0~1000。保存持久化到 llm-error-retry.rules.json；删除该文件回落到 cordis.patch.yml 默认规则。"));          children.push(e("div", { style: Object.assign({}, S.title, { marginTop: "14px", fontSize: "13px" }), key: "eh" }, "最近活动"));
+          children.push(e("div", { style: S.hint, key: "h" }, "规则码四种形态：① HTTP 状态码（429、500…：匹配 status、code 与 message 中独立数字）；② 机器码（RATE_LIMIT、QUOTA、SERVER…）；③ 字段=值（如 code=insufficient_quota、type=rate_limit_exceeded：匹配 provider 返回 JSON 字段，含被压平进 message 的响应体）；④ msg~子串（如 msg~finish_reason: error：忽略大小写地子串匹配失败 message，用于 provider 用 finish_reason 终止请求时报的 Provider finish_reason: error，此时既无 status 也只有通用 code PI_AI_ERROR）。多条规则按顺序取第一条命中。次数上限 0~1000。表里就是全部生效规则：默认规则也写在表里、可直接改或删（删掉再保存就不会再被补回来），「恢复默认规则」把列表整份换回补丁行的 config.rules。"));          children.push(e("div", { style: Object.assign({}, S.title, { marginTop: "14px", fontSize: "13px" }), key: "eh" }, "最近活动"));
           if ((snap.activity || []).length === 0) {
             children.push(e("div", { style: { opacity: 0.6, fontSize: "12px" }, key: "ae" }, "暂无记录"));
           } else {
